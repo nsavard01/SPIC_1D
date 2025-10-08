@@ -1,0 +1,3 @@
+/home/nsavard/ImplicitPic1D/ImplicitPic1D/SPIC_1D/CMakeFiles/pic1d.dir
+/home/nsavard/ImplicitPic1D/ImplicitPic1D/SPIC_1D/CMakeFiles/edit_cache.dir
+/home/nsavard/ImplicitPic1D/ImplicitPic1D/SPIC_1D/CMakeFiles/rebuild_cache.dir

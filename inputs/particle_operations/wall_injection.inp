@@ -1,0 +1,11 @@
+-------------------------------------
+e : particle_name
+0 : wall node to release from
+50.0 : current density (A/m^2)
+0.0 : x component of velocity (m/s)
+0.0 : y component of velocity (m/s)
+0.0 : z component of velocity (m/s)
+0.1 : Flux temperature (eV)
+-----------------------------------
+
+END

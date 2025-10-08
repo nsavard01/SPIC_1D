@@ -1,0 +1,11 @@
+16 ! number of processors per mpi thread
+0 ! scheme (0 = MC-PIC, 1 = EC-PIC, 2 = I-NGP)
+50.0 6e-12 ! time step , first is fraction of initial plasma frequency, second is actual time step in seconds, take minimum 1.8436578171091445e-10
+2e-4 ! total simulation time 9.43952802359882e-05
+8e-6 1e-5 1e-5 ! total averaging time, acceptance relative residual in domain in voltage and density of first particle
+21 ! number of diagnostic times
+test_exp_release_high_density_10cm_20PPC_6ps_1400cells ! save file name
+../../../longer_test/ ! Save directory relative path
+no ! Restart(yes/no) and save directory to take from
+END
+

@@ -1,0 +1,1 @@
+/opt/intel/oneapi/mpi/2021.14/bin/mpiicpx -O3 -fopenmp -Wall CMakeFiles/pic1d.dir/src/main.cpp.o -o pic1d 

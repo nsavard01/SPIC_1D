@@ -1,0 +1,8 @@
+1400 : number of cells
+0.1 : Domain length in meters
+0 0 10 0.0001 0.05 : grid type (0 = uniform, 1 = sinusoidal, 2 = half-sinusoidal, 3 = uniform + sinusoidal + uniform) , curvilinear == 1, extra numbers for grid generation
+1 1 : Left and right side boundary condition (1 dirichlet, 2 Neumann-reflective-symmetric, 3 periodic, 4 = RF-Dirichlet)
+0 200 : Voltage for left and right side boundary, used for dirichlet and periodic conditions. For RF-Dirichlet, voltage is half amplitude
+0.0 : Osciallating voltage frequency (Hz)
+0 : smoothing (0 = off)
+ENDFILE
