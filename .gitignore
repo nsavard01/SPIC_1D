@@ -11,8 +11,5 @@ tmp*
 *.bin
 *.dat
 *Zone.Identifier
-SSPIC_1D/scripts/_pychache_/
-SSCPIC_1D/build/
-!PIC1D/CollisionData/*.dat
 *.dbg
-SPIC_1D/build/
+/build/
