@@ -1,4 +1,4 @@
-0 : type of solver (0 = AA-picard)
+0 : type of non-linear solver (0 = AA-picard)
 10 : number of past iterations to store
 50 : maximum amount of function evaluations
 0.5 : relaxation parameter

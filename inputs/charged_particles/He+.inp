@@ -1,11 +1,11 @@
-He+ : name
-1 : charge
-4.002602 : mass in dalton, if ion make total amu mass of neutral
-875 : number particles per thread
-7e16 : average total density (m^-3)
-0.025 : average temperature (eV)
-4 : initial factor array lengths
+He+ : name of particle
+1 : charge of particle in units of elementary charge
+4.002602 : mass in dalton, if ion make total amu mass of neutral particle
+2048 : number particles per thread
+2.56e14 : average intial total density (m^-3)
+0.025 : average initial temperature (eV)
+4 : Initial factor of increase in particle array (maximum possible number of particles scaled by this number)
 0 : EEDF type (0 = maxwellian)
-0.0 : drift velocity in x
+0.0 : initial drift velocity in x-direction
 1 3 : number coordinates in space (x,y,z) and velocity (v_x, v_y, v_z)
 ENDFILE
