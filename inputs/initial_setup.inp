@@ -5,7 +5,7 @@
 7.374631268436579e-6 1e-5 1e-5 ! total averaging time, acceptance relative residual in domain in voltage and density of first particle to determine if averaging ends earlier than given time
 21 ! number of diagnostic times (includes initial state)
 RF_Turner_test ! save file name
-../../../longer_test/ ! This is the directory to save to, this is a relative path!
+../../SPIC_test/ ! This is the directory to save to, this is a relative path!
 no ! Restart(yes/no) which uses latest data from file paths given above and continues using these as starting condition
 END
 
