@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <dirent.h>
 #include "rand_gen/maxwell_generator.hpp"
+#include <sys/stat.h>
 
 // static variables for charged_particle class
 std::vector<std::vector<double>> charged_particle::xi_sorted, charged_particle::y_sorted, charged_particle::z_sorted, charged_particle::v_x_sorted, charged_particle::v_y_sorted, charged_particle::v_z_sorted;
@@ -1469,10 +1470,15 @@ std::vector<charged_particle> read_charged_particle_inputs(const std::string& di
             }
 
             struct dirent* entry;
+            bool found_file = false;
+            
             while ((entry = readdir(dir)) != nullptr) {
-                if (entry->d_type == DT_REG) {  // regular file
+                if (entry->d_name[0] == '.') continue;
+                std::string filename = directory_path + entry->d_name;
+                struct stat st;
+                if (stat(filename.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                    found_file = true;
                     count_number_particles++;
-                    std::string filename = directory_path + entry->d_name;
                     std::string line;
                     std::ifstream file(filename);
                     if (!file) {
@@ -1551,6 +1557,9 @@ std::vector<charged_particle> read_charged_particle_inputs(const std::string& di
             }   
         
             closedir(dir);
+            if (!found_file && mpi_vars::mpi_rank == 0) {
+                std::cout << "No charged particles included!" << std::endl;
+            }
 
             // Initialize index_order with indices [0, 1, 2, ..., count_number_particles - 1]
             index_order.resize(count_number_particles);

@@ -10,6 +10,7 @@
 #include <mpi.h>
 #include <numeric>
 #include <algorithm>
+#include <sys/stat.h>
 
 target_particle::target_particle(double mass_in, double temp_in, double density_in, double v_drift_in, std::string name_in)
     {
@@ -99,10 +100,15 @@ std::vector<target_particle> read_target_particle_inputs(const std::string& dire
             }
 
             struct dirent* entry;
+            bool found_file = false;
+            
             while ((entry = readdir(dir)) != nullptr) {
-                if (entry->d_type == DT_REG) {  // regular file
+                if (entry->d_name[0] == '.') continue;
+                std::string filename = directory_path + entry->d_name;
+                struct stat st;
+                if (stat(filename.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                    found_file = true;
                     count_number_particles++;
-                    std::string filename = directory_path + entry->d_name;
                     std::string line;
                     std::ifstream file(filename);
                     if (!file) {
@@ -144,6 +150,10 @@ std::vector<target_particle> read_target_particle_inputs(const std::string& dire
             }   
         
             closedir(dir);
+
+            if (!found_file && mpi_vars::mpi_rank == 0) {
+                std::cout << "No target particles included!" << std::endl;
+            }
 
             // Initialize index_order with indices [0, 1, 2, ..., count_number_particles - 1]
             index_order.resize(count_number_particles);

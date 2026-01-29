@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
 
 
 static double sin_third_rot = std::sin(2.0 * M_PI / 3.0);
@@ -734,12 +735,15 @@ std::vector<null_collider> read_null_collision_inputs(const std::string& directo
             }
 
             struct dirent* entry;
-            if ((entry = readdir(dir)) == nullptr && mpi_vars::mpi_rank == 0) {
-                std::cout << "No binary collisions included!" << std::endl;
-            }
+            bool found_file = false;
+            
             while ((entry = readdir(dir)) != nullptr) {
-                if (entry->d_type == DT_REG) {  // regular file
-                    std::string filename = directory_path + entry->d_name;
+                if (entry->d_name[0] == '.') continue;
+                std::string filename = directory_path + entry->d_name;
+                struct stat st;
+                if (stat(filename.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                    found_file = true;
+                    
                     std::ifstream file(filename);
                     if (!file) {
                         std::cerr << "Error: Unable to open file " << filename << std::endl;
@@ -912,6 +916,9 @@ std::vector<null_collider> read_null_collision_inputs(const std::string& directo
                     file.close();
                     
                 }
+            }
+            if (!found_file && mpi_vars::mpi_rank == 0) {
+                std::cout << "No binary collisions included!" << std::endl;
             }
         }
         MPI_Barrier(MPI_COMM_WORLD);

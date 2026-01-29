@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
 
 
 std::vector<std::unique_ptr<charged_particle_operator>> read_particle_operators(const std::string& directory_path, std::vector<charged_particle>& particle_list, const domain& world) {
@@ -24,9 +25,13 @@ std::vector<std::unique_ptr<charged_particle_operator>> read_particle_operators(
             }
 
             struct dirent* entry;
+            bool found_file = false;
+            
             while ((entry = readdir(dir)) != nullptr) {
-                if (entry->d_type == DT_REG) {  // regular file
-                    std::string filename = directory_path + entry->d_name;
+                if (entry->d_name[0] == '.') continue;
+                std::string filename = directory_path + entry->d_name;
+                struct stat st;
+                if (stat(filename.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                     if (!filename.compare(directory_path + "wall_injection.inp")) {
                         std::vector<double> current_density, v_therm, particle_location;
                         std::vector<int> particle_indx;
@@ -144,6 +149,10 @@ std::vector<std::unique_ptr<charged_particle_operator>> read_particle_operators(
             }   
         
             closedir(dir);
+
+            if (!found_file && mpi_vars::mpi_rank == 0) {
+                std::cout << "No particle operations included!" << std::endl;
+            }
         
         }
         MPI_Barrier(MPI_COMM_WORLD);
