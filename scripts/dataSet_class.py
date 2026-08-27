@@ -217,6 +217,29 @@ class dataSet:
     def get_grid(self):
         return np.fromfile(self.path + '/domain/grid.dat', dtype = 'float')
 
+    def smooth(self, y, passes = 1):
+        # Binomial (1 2 1)/4 filter, applied after the fact.  Densities and potentials are
+        # written unsmoothed, so this is where you smooth them if you want to.  The image used
+        # past a wall matches the deposit: wrapped for periodic, mirrored otherwise.
+        periodic = (self.left_boundary == 'Periodic')
+        y = np.asarray(y, dtype = float)
+        for _ in range(passes):
+            if periodic:
+                left = np.roll(y, 1)
+                right = np.roll(y, -1)
+            else:
+                left = np.concatenate(([y[0]], y[:-1]))
+                right = np.concatenate((y[1:], [y[-1]]))
+            y = 0.25 * (left + 2.0 * y + right)
+        return y
+
+    def get_field_grid(self):
+        # I-CIC keeps the potential and the charge density on the cell centers, every other
+        # scheme keeps them on the grid nodes
+        if (self.scheme == 'I-CIC'):
+            return self.get_half_grid()
+        return self.get_grid()
+
     def get_half_grid(self):
         x = np.fromfile(self.path + '/domain/grid.dat', dtype = 'float')
         return 0.5 * (x[0:-1] + x[1::])

@@ -1,0 +1,8 @@
+2048 : number of cells
+0.14867883989400926 : Domain length in meters
+0 0 10 0.0001 0.05 : grid type (0 = uniform), curvilinear flag, extra grid numbers
+3 3 : Left and right side boundary condition (1 dirichlet, 2 Neumann, 3 periodic, 4 RF)
+0 0 : Voltage for left and right side boundary
+0.0 : Oscillating voltage frequency if RF used (Hz)
+0 : smoothing for implicit schemes (0 = off, 1 = on)
+ENDFILE

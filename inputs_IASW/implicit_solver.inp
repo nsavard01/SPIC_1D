@@ -1,0 +1,7 @@
+0 : type of non-linear solver (0 = AA-picard)
+10 : number of past iterations to store
+100 : maximum amount of function evaluations
+0.5 : relaxation parameter
+0.0 : relative convergence criteria
+1e-8 : absolute convergence criteria
+ENDFILE

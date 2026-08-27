@@ -334,63 +334,39 @@ void ES_solver_INGP::push_particles(const int thread_id, double del_t, std::vect
 }
 
 void ES_solver_INGP::write_particle_densities(const std::string file_path, const std::string filename, std::vector<charged_particle>& particle_list, const domain& world) const {
-    // Loop over all particles and deposit density
-    
-    int number_nodes = world.number_nodes;
-    int number_cells = world.number_cells;
-    int num_particles = particle_list.size();
+    // Written unsmoothed: the raw linear accumulation on the grid nodes divided by the volume
+    // each node owns.  Smoothing belongs in post-processing, so that the file always holds what
+    // the particles actually deposited and the filter stays a choice made afterwards.
+    //
+    // The charge node here sits on a cell edge rather than a cell centre, so the length it owns
+    // is half of each neighbouring cell.  At a wall that is a single half cell; across a periodic
+    // seam the two end accumulations are the same node, so they are summed and share the volume.
+    const int number_nodes = world.number_nodes;
+    const int number_cells = world.number_cells;
+    const int num_particles = particle_list.size();
+    const bool periodic = (world.left_boundary_condition == 3);
+    auto cell_width = [&](int cell) {
+        return (world.domain_type == 0) ? world.min_dx : world.dx_dxi[cell];
+    };
     for (int i = 0; i < num_particles; ++i) {
         charged_particle& particle = particle_list[i];
-        // Set work space to 0
         std::vector<double>& density = particle.density;
-        if (world.left_boundary_condition == 3) {
+        if (periodic) {
             density[0] = density[0] + density[number_cells];
             density[number_cells] = density[0];
-        } else {
-            // Only half volume represented
-            density[0] = 2.0 * density[0];
-            density[number_cells] = density[number_cells] * 2.0;
         }
-        // MPI_Allreduce(MPI_IN_PLACE, density.data(), number_nodes, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (this->smoothing) {
-            std::vector<double> density_copy = density; // Copy density for smoothing
-            if (world.left_boundary_condition == 3) {
-                // density is 0 at edge
-                density[0] = 0.25 * (2.0 * density_copy[0] + density_copy[1] + density_copy[number_cells]);
+        for (int j = 0; j < number_nodes; ++j) {
+            double node_volume;
+            if (j == 0 || j == number_cells) {
+                node_volume = periodic ? 0.5 * (cell_width(0) + cell_width(number_cells-1))
+                                       : 0.5 * cell_width(j == 0 ? 0 : number_cells-1);
             } else {
-                // Even for dirichlet assume symmetry at edge
-                density[0] = 0.25 * (2.0 * density_copy[0] + 2.0 * density_copy[1]); // Smooth first cell
+                node_volume = 0.5 * (cell_width(j-1) + cell_width(j));
             }
-            for (int j = 1; j < number_cells; j++) {
-                density[j] = 0.25 * (density_copy[j-1] + 2.0 * density_copy[j] + density_copy[j+1]); // Smooth interior cells
-            }
-            if (world.right_boundary_condition == 3) {
-                // density is 0 at edge
-                density[number_cells] = density[0];
-            } else {
-                // Even for dirichlet assume symmetry at edge
-                density[number_cells] = 0.25 * (2.0 * density_copy[number_cells] + 2.0 * density_copy[number_cells]); // Smooth first cell
-            }
-        }   
-        if (world.domain_type == 0) {
-            // uniform
-            double del_x = world.min_dx;
-            for (int i = 0;i<number_nodes; i++) {
-                density[i] = density[i] * particle.weight / del_x;
-            }
-        } else {
-            // non-uniform
-            density[0] = density[0] * particle.weight / world.dx_dxi[0];
-            density[number_cells] = density[number_cells] * particle.weight / world.dx_dxi[number_cells-1];
-            for (int i = 1;i<number_cells; i++) {
-                double cell_size = 0.5 * (world.dx_dxi[i-1] + world.dx_dxi[i]);
-                density[i] = density[i] * particle.weight / cell_size;
-            }
+            density[j] = density[j] * particle.weight / node_volume;
         }
         if (mpi_vars::mpi_rank == 0) {write_vector_to_binary_file(density, number_nodes, file_path + "/charged_particles/" + particle.name + "/density/" + filename, 0);}
-
     }
-
 }
 
 void ES_solver_INGP::integrate_time_step(const int thread_id, double del_t, double current_time, const domain& world, std::vector<charged_particle>& particle_list) {

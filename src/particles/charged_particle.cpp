@@ -170,7 +170,41 @@ void charged_particle::initialize_weight(double n_ave, double L_domain) {
     this->q_times_wp = this->charge * this->weight;
 }
 
-void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift) {
+// Map between the logical coordinate the particles are stored in and physical position.
+// Field nodes sit on the integers, so within a cell the two are related linearly.
+static double logical_to_physical(const domain& world, double xi_p) {
+    int cell = int(xi_p);
+    if (cell >= world.number_cells) { cell = world.number_cells - 1; }
+    if (cell < 0) { cell = 0; }
+    return world.grid_nodes[cell] + (xi_p - double(cell)) * (world.grid_nodes[cell+1] - world.grid_nodes[cell]);
+}
+
+static double physical_to_logical(const domain& world, double x) {
+    // grid_nodes is monotonic, so locate the cell then interpolate inside it
+    int low = 0, high = world.number_cells;
+    while (high - low > 1) {
+        const int mid = (low + high) / 2;
+        if (world.grid_nodes[mid] <= x) { low = mid; } else { high = mid; }
+    }
+    return double(low) + (x - world.grid_nodes[low]) / (world.grid_nodes[low+1] - world.grid_nodes[low]);
+}
+
+// Drift velocity of the initial distribution.  dist_type 1 and 2 modulate the drift along
+// the domain, which together with the matching density perturbation sets up the ion
+// acoustic shock wave problem.
+static double initial_drift(const domain& world, double xi_p, double v_drift, double alpha_drift, int dist_type) {
+    if (dist_type == 0 || alpha_drift == 0.0) {
+        return v_drift;
+    }
+    const double phase = 2.0 * M_PI * logical_to_physical(world, xi_p) / world.length_domain;
+    if (dist_type == 1) {
+        return v_drift * (1.0 + alpha_drift * std::cos(phase));
+    }
+    return v_drift * (1.0 - alpha_drift * std::sin(phase));
+}
+
+void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift, const domain& world,
+    int dist_type, double alpha_drift) {
     double v_therm = std::sqrt(T_ave * constants::elementary_charge / this->mass);
     double sum_v_sq_x = 0.0;
     double sum_v_sq_y = 0.0;
@@ -185,7 +219,7 @@ void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift) 
             size_t end_part = this->number_particles[thread_id][0];
             for (size_t part_num = 0; part_num < end_part; part_num++){
                 double& v_x = this->v_x[thread_id][part_num];
-                maxwellian_1D(v_x, v_therm, v_drift);
+                maxwellian_1D(v_x, v_therm, initial_drift(world, this->xi[thread_id][part_num], v_drift, alpha_drift, dist_type));
                 sum_v_x += v_x;
                 sum_v_sq_x += v_x * v_x;
             }
@@ -200,7 +234,7 @@ void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift) 
             for (size_t part_num = 0; part_num < end_part; part_num++){
                 double& v_x = this->v_x[thread_id][part_num];
                 double& v_y = this->v_y[thread_id][part_num];
-                maxwellian_2D(v_x, v_y, v_therm, v_drift);
+                maxwellian_2D(v_x, v_y, v_therm, initial_drift(world, this->xi[thread_id][part_num], v_drift, alpha_drift, dist_type));
                 sum_v_x += v_x;
                 sum_v_y += v_y;
                 sum_v_sq_x += v_x * v_x; 
@@ -221,7 +255,7 @@ void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift) 
                 double& v_x = this->v_x[thread_id][part_num];
                 double& v_y = this->v_y[thread_id][part_num];
                 double& v_z = this->v_z[thread_id][part_num];
-                maxwellian_3D(v_x, v_y, v_z, v_therm, v_drift);
+                maxwellian_3D(v_x, v_y, v_z, v_therm, initial_drift(world, this->xi[thread_id][part_num], v_drift, alpha_drift, dist_type));
                 sum_v_x += v_x;
                 sum_v_y += v_y;
                 sum_v_z += v_z;
@@ -245,6 +279,51 @@ void charged_particle::initialize_rand_maxwellian(double T_ave, double v_drift) 
     this->average_temperature = this->mass * total_sum_v_square_temp / static_cast<double>(this->total_number_particles) / constants::elementary_charge / double(this->number_velocity_coordinates);
 }
 
+
+// Quiet start loading of a perturbed density profile,
+//   dist_type 1:  n(x) proportional to 1 + alpha * cos(2 pi x / L)
+//   dist_type 2:  n(x) proportional to 1 - alpha * sin(2 pi x / L)   (used by the IASW case)
+// Particles are placed at evenly spaced quantiles of the cumulative distribution, found by
+// Newton iteration, which keeps the initial density noise far below a random loading.
+void charged_particle::initialize_rand_position_perturbed(const domain& world, int dist_type, double alpha) {
+    if (dist_type == 0 || alpha == 0.0) {
+        this->initialize_rand_position_uniform(world);
+        return;
+    }
+    const double L_domain = world.length_domain;
+    const int number_threads = omp_get_max_threads();
+    // global quantile index so the loading stays quiet across threads and MPI ranks
+    const size_t number_per_thread = this->number_particles[0][0];
+    const double total_number = double(number_per_thread) * double(number_threads) * double(mpi_vars::mpi_size);
+    #pragma omp parallel
+    {
+        const int thread_id = omp_get_thread_num();
+        const size_t index_offset = number_per_thread * size_t(mpi_vars::mpi_rank * number_threads + thread_id);
+        const size_t number_part = this->number_particles[thread_id][0];
+        std::vector<double>& xi_local = this->xi[thread_id];
+        for (size_t part_idx = 0; part_idx < number_part; part_idx++){
+            const double u = (double(index_offset + part_idx) + 0.5) / total_number;
+            double x = L_domain * u;
+            for (int iter = 0; iter < 50; ++iter) {
+                const double phase = 2.0 * M_PI * x / L_domain;
+                double F, dF;
+                if (dist_type == 1) {
+                    F = x / L_domain + alpha * std::sin(phase) / (2.0 * M_PI) - u;
+                    dF = (1.0 + alpha * std::cos(phase)) / L_domain;
+                } else {
+                    F = x / L_domain + alpha * (1.0 - std::cos(phase)) / (2.0 * M_PI) - u;
+                    dF = (1.0 + alpha * std::sin(phase)) / L_domain;
+                }
+                const double step = F / dF;
+                x -= step;
+                if (std::abs(step) < 1e-14 * L_domain) { break; }
+            }
+            if (x < 0.0) { x = 0.0; }
+            if (x > L_domain) { x = L_domain; }
+            xi_local[part_idx] = physical_to_logical(world, x);
+        }
+    }
+}
 
 void charged_particle::initialize_rand_position_uniform(const domain& world) {
     
@@ -356,7 +435,8 @@ void charged_particle::sort_particle(int thread_id, int number_cells) {
     
 }
 
-void charged_particle::get_particle_diagnostics(const int thread_id, const int number_cells, const int density_interp_order) {
+void charged_particle::get_particle_diagnostics(const int thread_id, const int number_cells, const int density_interp_order,
+    const int left_boundary, const int right_boundary) {
 
     
     // interpolation based on order given
@@ -389,10 +469,32 @@ void charged_particle::get_particle_diagnostics(const int thread_id, const int n
         xi_temp = xi_local[part_num];
         v_x_temp = v_x_local[part_num];
         local_indx = int(xi_temp);
+        if (local_indx >= size_t(number_cells)) { local_indx = number_cells - 1; } // particle on the periodic seam
         if (density_interp_order == 1) {
             double d = xi_temp - local_indx;
             local_density[local_indx] += (1.0 - d);
             local_density[local_indx+1] += d;
+        } else if (density_interp_order == 2) {
+            // CIC scheme, quadratic B-spline onto the cell centred nodes.  A cloud sticking
+            // out past a wall is folded back in so that the diagnostic conserves particles.
+            const double d = xi_temp - local_indx;
+            const double weight_left = 0.5 * (1.0 - d) * (1.0 - d);
+            const double weight_right = 0.5 * d * d;
+            local_density[local_indx] += 0.5 + d - d * d;
+            if (local_indx > 0) {
+                local_density[local_indx-1] += weight_left;
+            } else if (left_boundary == 3) {
+                local_density[number_cells-1] += weight_left;
+            } else {
+                local_density[0] += weight_left;
+            }
+            if (int(local_indx) < number_cells-1) {
+                local_density[local_indx+1] += weight_right;
+            } else if (right_boundary == 3) {
+                local_density[0] += weight_right;
+            } else {
+                local_density[number_cells-1] += weight_right;
+            }
         }
         if (use_vy) {
             v_y_temp = this->v_y[thread_id][part_num];
@@ -1451,6 +1553,8 @@ std::vector<charged_particle> read_charged_particle_inputs(const std::string& di
     
     std::vector<charged_particle> particle_list;
     std::vector<double> mass_in, charge_in, n_ave, temp_in, v_drift;
+    std::vector<double> alpha_density, alpha_drift;
+    std::vector<int> dist_type, match_positions;
     std::vector<size_t> num_part_thread, factor, EEDF_type;
     std::vector<std::string> particle_names;
     std::vector<int> index_order, number_space_coordinates, number_velocity_coordinates;
@@ -1552,6 +1656,25 @@ std::vector<charged_particle> read_charged_particle_inputs(const std::string& di
                     number_space_coordinates.push_back(number_space);
                     number_velocity_coordinates.push_back(number_velocity);
                     iss.clear();
+                    // Optional initial distribution line, absent in older input files:
+                    //   dist_type (0 uniform, 1 cosine, 2 sine), density perturbation amplitude,
+                    //   drift modulation amplitude, and whether to copy the positions of the
+                    //   species loaded before this one (a neutral start).
+                    int dist_type_temp = 0, match_temp = 0;
+                    double alpha_temp = 0.0, alpha_drift_temp = 0.0;
+                    if (std::getline(file, line)) {
+                        iss.str(line);
+                        if (!(iss >> dist_type_temp)) {
+                            dist_type_temp = 0;
+                        } else {
+                            iss >> alpha_temp >> alpha_drift_temp >> match_temp;
+                        }
+                        iss.clear();
+                    }
+                    dist_type.push_back(dist_type_temp);
+                    alpha_density.push_back(alpha_temp);
+                    alpha_drift.push_back(alpha_drift_temp);
+                    match_positions.push_back(match_temp);
                     file.close();
                 }
             }   
@@ -1591,8 +1714,18 @@ std::vector<charged_particle> read_charged_particle_inputs(const std::string& di
         
         temp_particle.initialize_number_coordinates(number_space, number_velocity);
         temp_particle.initialize_weight(n_ave[i], world.length_domain);
-        temp_particle.initialize_rand_maxwellian(temp_in[i], v_drift[i]);
-        temp_particle.initialize_rand_position_uniform(world);
+        // positions are set first because the initial drift can depend on them
+        if (match_positions[i] == 1 && !particle_list.empty()) {
+            // neutral start, sit on top of the species loaded before this one
+            temp_particle.xi = particle_list.back().xi;
+            if (mpi_vars::mpi_rank == 0) {
+                std::cout << "Loading " << name << " on the positions of " << particle_list.back().name
+                    << " for a neutral start." << std::endl;
+            }
+        } else {
+            temp_particle.initialize_rand_position_perturbed(world, dist_type[i], alpha_density[i]);
+        }
+        temp_particle.initialize_rand_maxwellian(temp_in[i], v_drift[i], world, dist_type[i], alpha_drift[i]);
         particle_list.push_back(temp_particle);
     }
 

@@ -1,0 +1,10 @@
+32 ! number of openmp threads per mpi rank
+3 ! scheme (0 = MC-PIC, 1 = EC-PIC, 2 = I-NGP, 3 = I-CIC)
+2.0 1.0 ! time step, fraction of initial plasma frequency, then absolute (s)
+5.317772131794625e-06 ! total simulation time in seconds
+5.317772131794625e-08 1e-6 1e-6 ! averaging time, relative residual acceptance for phi and density
+21 ! number of diagnostic times
+IASW_Chacon2013_ICIC ! save file name
+../outputs/ ! directory to save to, relative to the build directory
+no ! Restart(yes/no)
+END

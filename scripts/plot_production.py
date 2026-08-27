@@ -14,7 +14,7 @@ def plot_ave_density(dataSet, name = "", label = "", marker = 'o', linestyle = '
         colors = ['b', 'r', 'g', 'k', 'c', 'm', 'y']
         for i,name in enumerate(dataSet.particles.keys()):
             n = dataSet.get_ave_density(name)
-            grid = dataSet.get_grid()
+            grid = dataSet.get_field_grid()
             plt.plot(grid, n,  linewidth = 2, linestyle = linestyle, marker = marker, markersize = 2,color = colors[i], label = r'$n_{' + name +  '}$')
         plt.xlabel('Distance (m)')
         plt.ylabel('Particle Density (1/m^3)')
@@ -25,7 +25,7 @@ def plot_ave_density(dataSet, name = "", label = "", marker = 'o', linestyle = '
             raise Warning("For average density, particle", name, "does not exist in the dataSet!")
         else:
             n = dataSet.get_ave_density(name)
-            grid = dataSet.get_grid()
+            grid = dataSet.get_field_grid()
             plt.plot(grid, n,  linestyle = linestyle, marker = marker, markersize = 2, label = label)
             plt.xlabel('Distance (m)')
             plt.ylabel(name + ' Density (1/m^3)')
@@ -34,7 +34,7 @@ def plot_ave_density(dataSet, name = "", label = "", marker = 'o', linestyle = '
 def plot_ave_phi(dataSet, label = '', marker = 'o', linestyle = '--'):
 
     phi = dataSet.get_ave_phi()
-    grid = dataSet.get_grid()
+    grid = dataSet.get_field_grid()
     plt.plot(grid, phi, marker = marker, linestyle = linestyle, markersize = 2, label = label)
     plt.xlabel('Distance (m)')
     plt.ylabel('Potential (V)')
@@ -104,7 +104,7 @@ def update_plot(i, ax, x, y_set, x_label, y_label, legend_label):
 def animation(dataSet, type, nameList = [],boolMakeAnimation = False, savePath = "temp_fig.gif", pauseTime = 0.05):
     if not nameList:
         nameList = list(dataSet.particles.keys())
-    x_grid = dataSet.get_grid()
+    x_grid = dataSet.get_field_grid()
     x_half_grid = dataSet.get_half_grid()
     x_max = x_grid[-1]
     x_min = x_grid[0]

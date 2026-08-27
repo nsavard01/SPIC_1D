@@ -1,4 +1,4 @@
-This is a 1D electrostatic Particle-in-Cell (PIC) code. The S stands for Savard, because I am creative. This is a re-written version of Fortran code written in C++ due to its inherent ability to use Object-oriented-program (Fortran does have this, but it is not a foundation of the language), and its continued popularity, which I hope will somewhat future-proof the code. It includes explicit formulations (momentum-conserving and energy-conserving), as well as implicit energy-and-charge conserving to the lowest degree of interpolation (nearest-grid-point field to particle, linear particle to charge density). The following describes a rough outline of what is needed to run the code in its current iteration. Now that I no longer live in the academic bubble, it may be a while until this code is touched, but the hope is that it will be an appropriate base for graduate students in the future. Furthermore, time is now limited for working on this, including documentation. So while I appreciate that documentation here is total crap, I simply do not have time or motivation to make it professional-grade.
+This is a 1D electrostatic Particle-in-Cell (PIC) code. The S stands for Savard, because I am creative. This is a re-written version of Fortran code written in C++ due to its inherent ability to use Object-oriented-program (Fortran does have this, but it is not a foundation of the language), and its continued popularity, which I hope will somewhat future-proof the code. It includes explicit formulations (momentum-conserving and energy-conserving), as well as implicit energy-and-charge conserving at two interpolation orders: nearest-grid-point field to particle with linear particle to charge density (I-NGP), and cloud-in-cell, meaning linear field to particle with quadratic particle to charge density (I-CIC). The following describes a rough outline of what is needed to run the code in its current iteration. Now that I no longer live in the academic bubble, it may be a while until this code is touched, but the hope is that it will be an appropriate base for graduate students in the future. Furthermore, time is now limited for working on this, including documentation. So while I appreciate that documentation here is total crap, I simply do not have time or motivation to make it professional-grade.
 
 -------------
 COMPILATION
@@ -49,6 +49,60 @@ e : particle_name
 END
 
 The particle name must match the particle name given in the particle inputs.
+
+-------------
+SCHEMES
+-------------
+
+The scheme is chosen on line 2 of "initial_setup.inp":
+
+0 = MC-PIC   explicit, momentum conserving
+1 = EC-PIC   explicit, energy conserving
+2 = I-NGP    implicit, energy and charge conserving, nearest-grid-point field interpolation
+3 = I-CIC    implicit, energy and charge conserving, cloud-in-cell field interpolation
+
+The two implicit schemes differ in where the field and the potential live. I-NGP puts the
+potential and the charge density on the grid nodes and gives each cell a single constant
+field value, so a particle sees a field that jumps as it crosses a node. I-CIC swaps the
+two: the field lives on the grid nodes and the potential and charge density live at the
+cell centers. The cell a particle travels through is then bounded by field nodes rather
+than potential nodes, so the field it sees varies linearly and continuously as it moves
+through the domain, and the cell index it carries is continuous as well. Charge is
+deposited with the quadratic B-spline that is the integral of that linear weighting, which
+is what keeps the scheme energy conserving. Each sub-step within a cell is solved with
+Picard iterations on the mid-step position and is capped at a fraction of the local
+acceleration-gradient time scale.
+
+Because I-CIC keeps the potential and the density at the cell centers, those output arrays
+have "number of cells" entries rather than "number of cells + 1". The python dataSet class
+exposes get_field_grid(), which returns the right abscissa for whichever scheme was run.
+
+Note that for a periodic domain both implicit schemes pin the potential on the wall,
+which is a valid gauge choice for a periodic problem but does assume the wall sits at the
+given potential.
+
+
+-------------
+INITIAL DISTRIBUTION
+-------------
+
+Each charged particle .inp file may end with one optional line, which is absent in older
+input files and then defaults to a uniform loading:
+
+2 0.4 1.236 1 : dist type (0 uniform, 1 cosine, 2 sine), density alpha, drift alpha, match positions of previous species
+
+Distribution type 1 loads n(x) proportional to 1 + alpha*cos(2*pi*x/L) and modulates the
+drift by (1 + drift_alpha*cos(2*pi*x/L)); type 2 loads 1 + alpha*sin(2*pi*x/L) with the
+drift modulated by (1 - drift_alpha*sin(2*pi*x/L)). Positions are loaded as a quiet start,
+placed at evenly spaced quantiles of the cumulative distribution, so the initial density
+noise is far below a random loading. The last field, when set to 1, gives this species the
+same positions as the species loaded before it, which is how a charge neutral start is set
+up (species are loaded in order of increasing charge to mass ratio, so electrons first).
+
+The "inputs_IASW" folder holds a complete example of this: the Chacon 2013 ion acoustic
+shock wave problem on a periodic domain, which is the benchmark used for the implicit
+schemes. Copy its contents over "inputs" to run it.
+
 
 -------------
 EXAMPLE RUN

@@ -406,8 +406,12 @@ void simulation::diagnostics(int thread_id) {
     // write initial diagnostics
     
     
+    // I-CIC deposits charge with the quadratic B-spline onto cell centred nodes, every
+    // other scheme uses linear weighting onto the grid nodes
+    const int density_interp_order = (this->scheme_type == 3) ? 2 : 1;
     for (int part_num = 0; part_num < this->charged_particle_list.size(); part_num++){
-        this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells, 1);
+        this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells,
+            density_interp_order, this->world->left_boundary_condition, this->world->right_boundary_condition);
     }
     // #pragma omp barrier
     // this->field_solver->deposit_density(this->charged_particle_list, thread_id);
@@ -656,6 +660,10 @@ void simulation::averaging() {
         // initialize residual checks
         double res_phi = 1.0;
         double res_density = 1.0;
+        // I-CIC keeps the potential and charge density on the cell centers, every other
+        // scheme keeps them on the grid nodes
+        const int density_interp_order = (this->scheme_type == 3) ? 2 : 1;
+        const int number_average_nodes = (this->scheme_type == 3) ? this->world->number_cells : this->world->number_nodes;
         std::vector<double> average_phi = this->field_solver->phi;
         std::vector<double> average_phi_check = this->field_solver->phi;
         std::vector<double> average_density = this->charged_particle_list[0].density;
@@ -706,13 +714,14 @@ void simulation::averaging() {
             int thread_id = omp_get_thread_num();
             // Get current particle diagnostics
             for (int part_num = 0; part_num < this->charged_particle_list.size(); part_num++){
-                this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells, 1);
+                this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells, density_interp_order,
+                    this->world->left_boundary_condition, this->world->right_boundary_condition);
             }
             #pragma omp barrier
             // initialize initial average density
             #pragma omp master
             {
-                MPI_Allreduce(MPI_IN_PLACE, average_density_check.data(), this->world->number_nodes, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); // Synchronize charge density across all processes
+                MPI_Allreduce(MPI_IN_PLACE, average_density_check.data(), number_average_nodes, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); // Synchronize charge density across all processes
             }
             #pragma omp barrier
             while (this->current_time < end_simulation_time && (res_phi > this->res_acceptance_phi || res_density > this->res_acceptance_density)) {
@@ -752,12 +761,13 @@ void simulation::averaging() {
                 this->field_solver->integrate_time_step(thread_id, this->del_t, this->current_time, *this->world, this->charged_particle_list);
                 #pragma omp barrier
                 #pragma omp for
-                for (int i = 0; i < this->world->number_nodes; i++) {
+                for (int i = 0; i < number_average_nodes; i++) {
                     average_phi[i] += this->field_solver->phi[i];
                 }
                 #pragma omp barrier
                 for (int part_num = 0; part_num < this->charged_particle_list.size(); part_num++){
-                    this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells, 1);
+                    this->charged_particle_list[part_num].get_particle_diagnostics(thread_id, this->world->number_cells, density_interp_order,
+                    this->world->left_boundary_condition, this->world->right_boundary_condition);
                 }
                 #pragma omp barrier
                 for (int part_num = 0; part_num < number_charged_particles; part_num++){
@@ -774,7 +784,7 @@ void simulation::averaging() {
                     #pragma omp master
                     {   
                         // reduce density average
-                        MPI_Allreduce(this->charged_particle_list[0].density.data(), average_density.data(), this->world->number_nodes, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                        MPI_Allreduce(this->charged_particle_list[0].density.data(), average_density.data(), number_average_nodes, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
                         // first calculate for phi
                         res_phi = 0.0;
                         res_density = 0.0;
@@ -782,7 +792,7 @@ void simulation::averaging() {
                         double diff_phi;
                         double curr_average_density;
                         double diff_density;
-                        for (int i = 0; i < this->world->number_nodes; i++) {
+                        for (int i = 0; i < number_average_nodes; i++) {
                             // compute current running average
                             curr_average_phi = average_phi[i] / double(this->current_step + 1);
                             curr_average_density = average_density[i] / double(this->current_step + 1);
@@ -799,9 +809,9 @@ void simulation::averaging() {
                         // get average of summed phi, density
                         double integ_average_phi = integrate(this->world->grid_nodes, average_phi_check)/this->world->length_domain;
                         double integ_average_density = integrate(this->world->grid_nodes, average_density_check)/this->world->length_domain;
-                        res_phi = std::sqrt(res_phi / double(this->world->number_nodes));
+                        res_phi = std::sqrt(res_phi / double(number_average_nodes));
                         res_phi = res_phi/integ_average_phi;
-                        res_density = std::sqrt(res_density / double(this->world->number_nodes));
+                        res_density = std::sqrt(res_density / double(number_average_nodes));
                         res_density = res_density/integ_average_density;
                         this->next_diag_time = this->current_time + this->diag_time_division;
                     }
@@ -931,14 +941,14 @@ void simulation::averaging() {
             std::cout << "EDF averaging took " << total_EDF_averaging_time <<  " seconds" << std::endl;
             std::cout << "Ended over simulation time of " << this->current_time - start_sim_time << std::endl;
             std::cout << "Final residual in voltage is: " << res_phi << " and final residual in density is: " << res_density << std::endl;
-            write_vector_to_binary_file(average_phi_check, this->world->number_nodes, this->save_file_folder + "/phi/potential_average.dat", 0);
+            write_vector_to_binary_file(average_phi_check, number_average_nodes, this->save_file_folder + "/phi/potential_average.dat", 0);
             for (int part_num = 0; part_num < number_charged_particles; part_num++){
                 this->charged_particle_list[part_num].write_diagnostics_average(this->save_file_folder);
                 this->null_collider_list[part_num].write_diagnostics_average(this->save_file_folder, this->charged_particle_list, this->target_particle_list);
                 write_vector_to_binary_file(particle_energy_counts[part_num], EDF_num_bins, this->save_file_folder + "/charged_particles/" + this->charged_particle_list[part_num].name + "/EDF_average_counts.dat", 0);
                 write_vector_to_binary_file(particle_energy_bins[part_num], EDF_num_bins, this->save_file_folder + "/charged_particles/" + this->charged_particle_list[part_num].name + "/EDF_average_bins.dat", 0);
                 write_vector_to_binary_file(particle_energy_bin_sizes[part_num], EDF_num_bins, this->save_file_folder + "/charged_particles/" + this->charged_particle_list[part_num].name + "/EDF_average_bin_sizes.dat", 0);
-                for (int i = 0; i < this->world->number_nodes; i++) {
+                for (int i = 0; i < number_average_nodes; i++) {
                     this->charged_particle_list[part_num].density[i] /= double(this->current_step + 1);
                 }
             }

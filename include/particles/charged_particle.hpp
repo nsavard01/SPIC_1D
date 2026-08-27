@@ -36,14 +36,17 @@ public:
     static std::vector<std::vector<size_t>> sorted_number_particles_per_cell, cell_indices; //, particle_cell;
     charged_particle(double mass_in, double charge_in, size_t number_in, size_t final_in, std::string name_in, int number_nodes);
     // void get_diagnostics();
-    void get_particle_diagnostics(const int thread_id, const int number_cells, const int density_interp_order);
+    void get_particle_diagnostics(const int thread_id, const int number_cells, const int density_interp_order,
+        const int left_boundary, const int right_boundary);
     void sort_particle(int thread_id, int number_cells);
     void gather_mpi();
     void print_out() const;
     void initialize_number_coordinates(int space, int velocity);
     void initialize_weight(double n_ave, double L_domain);
-    void initialize_rand_maxwellian(double T_ave, double v_drift);
+    void initialize_rand_maxwellian(double T_ave, double v_drift, const domain& world,
+        int dist_type = 0, double alpha_drift = 0.0);
     void initialize_rand_position_uniform(const domain& world);
+    void initialize_rand_position_perturbed(const domain& world, int dist_type, double alpha);
     void ES_push_MC(int thread_id, double del_t, const std::vector<double>& E_field, 
         const double dx, const int left_boundary, const int right_boundary, int number_cells);
     void ES_push_EC_uniform(const int thread_id, double del_t, const std::vector<double>& E_field, 
@@ -59,6 +62,14 @@ public:
     void ES_push_EC_non_uniform(const int thread_id, double del_t, const std::vector<double>& E_field, 
         const std::vector<double>& dx_dxi, const std::vector<double>& grid, const int left_boundary, const int right_boundary, const int number_cells);    
     void deposit_particles_linear(const int thread_id, std::vector<double>& work_space) const;
+    void deposit_particles_quadratic(const int thread_id, std::vector<double>& work_space,
+        const int left_boundary, const int right_boundary, const int number_cells) const;
+    void ES_push_deposit_ICIC(const int thread_id, double del_t, std::vector<double>& work_space,
+        const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+        const int left_boundary, const int right_boundary, const int number_cells);
+    void ES_push_ICIC(const int thread_id, double del_t, int& number_sub_steps,
+        const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+        const int left_boundary, const int right_boundary, const int number_cells);
     // double get_KE_ave() const;
     // double get_KE_total() const;
     // void interpolate_particles();

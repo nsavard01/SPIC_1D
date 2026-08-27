@@ -9,6 +9,7 @@
 #include "ES_solvers/ES_solver_EC.hpp"
 #include "ES_solvers/ES_solver_MC.hpp"
 #include "ES_solvers/ES_solver_INGP.hpp"
+#include "ES_solvers/ES_solver_ICIC.hpp"
 #include "globals/mpi_vars.hpp"
 #include "globals/constants.hpp"
 #include <iostream>
@@ -352,6 +353,8 @@ std::unique_ptr<ES_solver> read_voltage_inputs(const std::string& filename, int 
         es_solver = std::make_unique<ES_solver_EC>(world);
     } else if (scheme_type == 2) {
         es_solver = std::make_unique<ES_solver_INGP>(world);
+    } else if (scheme_type == 3) {
+        es_solver = std::make_unique<ES_solver_ICIC>(world);
     } else {
         throw std::invalid_argument("Invalid scheme type for ES solver.");
     }
