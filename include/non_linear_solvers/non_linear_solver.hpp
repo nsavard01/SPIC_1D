@@ -13,6 +13,14 @@ public:
     int number_iterations, number_unknowns;
     size_t accum_iterations_count;
     double solver_time, accum_residual_norm;
+    // convergence bookkeeping: a step that exhausts max_iterations is accepted anyway,
+    // so it leaves no other trace.  These are running values over the whole run.
+    int max_iterations_used;        // most iterations any single step has needed
+    size_t non_converged_count;     // steps that hit max_iterations without converging
+    double worst_residual;          // largest final residual of any step
+    double convergence_tolerance;   // eps_a * sqrt(N), the absolute part of the test
+    int warnings_printed;
+    std::vector<double> residual_history;   // residual at each iteration of the current step
     virtual ~non_linear_solver() = default;
 
     virtual void initialize_diagnostic_files(const std::string& filename) const; // initialize diagnostic files

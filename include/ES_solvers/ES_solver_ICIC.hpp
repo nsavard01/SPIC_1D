@@ -36,10 +36,11 @@ public:
     double left_boundary_potential_past, right_boundary_potential_past;
     std::vector<std::vector<double>> particle_work_space; // per thread deposit scratch
 
-    // per species mover coefficients, rebuilt every field evaluation
-    std::vector<std::vector<double>> accel_node;   // q/m * E at each field node
-    std::vector<std::vector<double>> del_tau_min;  // largest sub-step allowed in each cell
+    // Per species mover coefficients, rebuilt every field evaluation.  Packed one record per
+    // cell so a sub-step touches a single cache line instead of three separate arrays.
+    std::vector<std::vector<CIC_cell_coefficients>> mover_cells;
 
+    int step_counter = 0;
     ES_solver_ICIC(const domain& world);
     void initialize_diagnostic_files(const std::string& filename) override;
     void write_diagnostics(const std::string& dir_name, int diag_number) override;

@@ -137,6 +137,27 @@ non_uniform_domain::non_uniform_domain(int num_cells, double length_domain, int 
                 this->cell_centers[i + num_uniform_cells] = this->grid_nodes[num_uniform_cells] + sinusoidal_xi_to_x(xi, double(number_sin_cells), length_sin, temp_double_1);
             }
         }
+    } else if (type == 5) {
+        // Inverse sinusoidal grid: cells are narrowest in the middle of the domain and widest
+        // at the walls, the opposite of type 1.  This is the map the Fortran CIC runs use for
+        // the shock problem; it matches constructInvSineGrid in PIC1D/CIC/src/mod_domain.f90.
+        if (temp_double_1 * double(this->number_cells) >= this->length_domain) {
+            std::cerr << "Smallest cell size " << temp_double_1 << " is too large for "
+                      << this->number_cells << " cells over " << this->length_domain << " m." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        const double amplitude = 1.0 - double(this->number_cells + 1) * temp_double_1 / this->length_domain;
+        for (int i = 1; i < this->number_cells; ++i) {
+            double phase = double(i) / double(this->number_cells);
+            this->grid_nodes[i] = this->length_domain
+                * (phase + amplitude * std::sin(2.0 * M_PI * phase) / (2.0 * M_PI));
+        }
+        this->min_dx = this->length_domain;
+        for (int i = 0; i < this->number_cells; ++i) {
+            this->dx_dxi[i] = this->grid_nodes[i+1] - this->grid_nodes[i];
+            this->cell_centers[i] = 0.5 * (this->grid_nodes[i] + this->grid_nodes[i+1]);
+            if (this->dx_dxi[i] < this->min_dx) { this->min_dx = this->dx_dxi[i]; }
+        }
     } else if (type == 4) {
         // uniform and half-sinusoidal grid generation
         int num_uniform_cells = temp_int_2; // Number of uniform cells

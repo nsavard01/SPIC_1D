@@ -6,6 +6,17 @@
 #include <string>
 #include "domain/domain.hpp"
 
+// Everything one implicit-CIC sub-step needs from its cell, held together so the whole
+// step reads a single cache line rather than reaching into four separate arrays.
+// q_dphi_* is q/m times the potential difference across the cell edge, which is what the
+// mover needs so that the cell width cancels; inv_dx converts it to an acceleration.
+struct alignas(32) CIC_cell_coefficients {
+    double q_dphi_left;
+    double q_dphi_right;
+    double inv_dx;
+    double del_tau_min;   // largest sub-step allowed in this cell
+};
+
 class charged_particle {
     
 public:
@@ -24,7 +35,10 @@ public:
     std::vector<std::vector<double>> energy_loss, accum_wall_momentum_loss;
     std::vector<std::vector<std::vector<double>>> momentum_loss;
     std::vector<std::vector<size_t>> number_particles, number_collidable_particles, wall_loss, final_idx;
-    std::vector<double> density, temperature;
+    // drift is the per cell mean of v_x.  temperature is a second moment about zero and so
+    // carries the drift with it; the first moment is what compares directly against an
+    // analytically specified drift profile, and is far less noisy at a given particle count.
+    std::vector<double> density, temperature, drift;
 
     // vectors for partial time integrations in pusher, used for particle injection randomized over time
     std::vector<std::vector<size_t>> number_particles_injected; // dimension (thread_id, number unique injections)
@@ -65,10 +79,10 @@ public:
     void deposit_particles_quadratic(const int thread_id, std::vector<double>& work_space,
         const int left_boundary, const int right_boundary, const int number_cells) const;
     void ES_push_deposit_ICIC(const int thread_id, double del_t, std::vector<double>& work_space,
-        const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+        const std::vector<CIC_cell_coefficients>& cells,
         const int left_boundary, const int right_boundary, const int number_cells);
     void ES_push_ICIC(const int thread_id, double del_t, int& number_sub_steps,
-        const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+        const std::vector<CIC_cell_coefficients>& cells,
         const int left_boundary, const int right_boundary, const int number_cells);
     // double get_KE_ave() const;
     // double get_KE_total() const;

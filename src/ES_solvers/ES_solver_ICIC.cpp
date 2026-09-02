@@ -293,7 +293,15 @@ void ES_solver_ICIC::make_EField(const domain& world) {
             break;
     }
     if (this->smoothing) {
+        // Smooth the potential difference across each node, not the field.  This is what
+        // the Fortran filters, and on a uniform grid the two are the same operator up to a
+        // constant.  On a stretched grid only this form keeps the smoothed deposit and the
+        // smoothed gather adjoint to one another: the divergence relating them carries no
+        // metric in these variables, so the (1 2 1)/4 stencils commute with it exactly,
+        // which is what the energy conservation argument rests on.
+        for (int i = 0; i <= number_cells; ++i) { this->E_field[i] *= this->node_scale[i]; }
         smooth_field(this->E_field, world);
+        for (int i = 0; i <= number_cells; ++i) { this->E_field[i] /= this->node_scale[i]; }
     }
 }
 
@@ -381,22 +389,21 @@ void ES_solver_ICIC::get_diagnostics(const domain& world, std::vector<charged_pa
 
 void ES_solver_ICIC::build_mover_coefficients(std::vector<charged_particle>& particle_list, const domain& world) {
     const int number_cells = world.number_cells;
-    const int number_nodes = world.number_nodes;
     const size_t num_particles = particle_list.size();
-    if (this->accel_node.size() != num_particles) {
-        this->accel_node.assign(num_particles, std::vector<double>(number_nodes, 0.0));
-        this->del_tau_min.assign(num_particles, std::vector<double>(number_cells, 0.0));
+    if (this->mover_cells.size() != num_particles) {
+        this->mover_cells.assign(num_particles, std::vector<CIC_cell_coefficients>(number_cells));
     }
     for (size_t i = 0; i < num_particles; ++i) {
         const double q_over_m = particle_list[i].q_over_m;
-        std::vector<double>& accel = this->accel_node[i];
-        std::vector<double>& tau_min = this->del_tau_min[i];
+        std::vector<CIC_cell_coefficients>& cells = this->mover_cells[i];
         // Store the potential difference across each node, not the field.  The mover divides
         // by the cell width to reach logical coordinates, and that width has to cancel against
         // the length the node's value spans, otherwise the work done on the particles no longer
         // matches the change in field energy once the cells stop being equal.
-        for (int j = 0; j < number_nodes; ++j) {
-            accel[j] = q_over_m * this->E_field[j] * this->node_scale[j];
+        for (int j = 0; j < number_cells; ++j) {
+            cells[j].q_dphi_left = q_over_m * this->E_field[j] * this->node_scale[j];
+            cells[j].q_dphi_right = q_over_m * this->E_field[j+1] * this->node_scale[j+1];
+            cells[j].inv_dx = 1.0 / this->dx_cells[j];
         }
         // cap the sub-step at a tenth of the local acceleration-gradient time scale so that
         // the Picard iteration inside the cell converges in a few passes.  A cell with a
@@ -404,8 +411,9 @@ void ES_solver_ICIC::build_mover_coefficients(std::vector<charged_particle>& par
         // large finite number rather than an infinity because the build enables fast math.
         constexpr double uncapped = 1e30;
         for (int j = 0; j < number_cells; ++j) {
-            const double accel_gradient = std::abs(accel[j] - accel[j+1]) / this->dx_cells[j];
-            tau_min[j] = (accel_gradient > 0.0) ? 0.1 * std::sqrt(this->dx_cells[j] / accel_gradient) : uncapped;
+            const double accel_gradient = std::abs(cells[j].q_dphi_left - cells[j].q_dphi_right) * cells[j].inv_dx;
+            cells[j].del_tau_min = (accel_gradient > 0.0)
+                ? 0.1 * std::sqrt(this->dx_cells[j] / accel_gradient) : uncapped;
         }
     }
 }
@@ -422,8 +430,7 @@ void ES_solver_ICIC::push_particles(const int thread_id, double del_t, std::vect
         charged_particle& particle = particle_list[i];
         std::fill(part_work_space.begin(), part_work_space.begin() + number_cells, 0.0);
         particle.ES_push_deposit_ICIC(thread_id, del_t, part_work_space,
-            this->accel_node[i], this->del_tau_min[i], this->dx_cells,
-            left_boundary, right_boundary, number_cells);
+            this->mover_cells[i], left_boundary, right_boundary, number_cells);
         const double q_times_wp = particle.q_times_wp;
         for (int j = 0; j < number_cells; j++) {
             local_work_space[j] += part_work_space[j] * q_times_wp;
@@ -495,6 +502,7 @@ void ES_solver_ICIC::integrate_time_step(const int thread_id, double del_t, doub
 
     #pragma omp master
     {
+        this->step_counter++;
         this->phi_past = this->phi;
         this->set_boundary_potentials(current_time, world);
         this->left_boundary_potential_past = this->left_boundary_potential;
@@ -503,7 +511,15 @@ void ES_solver_ICIC::integrate_time_step(const int thread_id, double del_t, doub
         this->potential_timer = 0.0;
     }
     #pragma omp barrier
+    const size_t failures_before = this->implicit_solver->non_converged_count;
     this->implicit_solver->solve(this->phi, integral_function);
+    #pragma omp master
+    {
+        if (mpi_vars::mpi_rank == 0 && this->implicit_solver->non_converged_count > failures_before) {
+            std::cout << "  ^ that non-convergence was at time step " << this->step_counter << std::endl;
+        }
+    }
+    #pragma omp barrier
     #pragma omp master
     {
         this->set_boundary_potentials(current_time + del_t, world);
@@ -518,8 +534,7 @@ void ES_solver_ICIC::integrate_time_step(const int thread_id, double del_t, doub
     std::vector<int> number_sub_steps(num_particles, 0);
     for (int i = 0; i < num_particles; ++i) {
         particle_list[i].ES_push_ICIC(thread_id, del_t, number_sub_steps[i],
-            this->accel_node[i], this->del_tau_min[i], this->dx_cells,
-            left_boundary, right_boundary, number_cells);
+            this->mover_cells[i], left_boundary, right_boundary, number_cells);
     }
     #pragma omp barrier
 }

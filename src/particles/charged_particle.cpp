@@ -45,6 +45,7 @@ charged_particle::charged_particle(double mass_in, double charge_in, size_t numb
     this->wall_loss.resize(number_threads);
     this->density.resize(number_nodes, 0.0);
     this->temperature.resize(number_nodes-1, 0.0);
+    this->drift.resize(number_nodes-1, 0.0);
     this->number_particles_per_cell.resize(number_nodes-1, 0);
     if (charged_particle::sorted_number_particles_per_cell.empty()) {
         charged_particle::sorted_number_particles_per_cell.resize(number_threads);
@@ -462,6 +463,7 @@ void charged_particle::get_particle_diagnostics(const int thread_id, const int n
     std::vector<size_t>& number_part_cell_local = charged_particle::sorted_number_particles_per_cell[thread_id];
     std::vector<double> local_density(number_cells+1, 0.0);
     std::vector<double> local_v_sqr(number_cells, 0.0);
+    std::vector<double> local_v_x(number_cells, 0.0);
     std::fill(number_part_cell_local.begin(), number_part_cell_local.end(), 0);
     double v_sqr_min_local = 1e10;
     double v_sqr_max_local = 0.0;
@@ -512,6 +514,7 @@ void charged_particle::get_particle_diagnostics(const int thread_id, const int n
         v_sqr_min_local = std::min(v_sqr_min_local, v_sqr);
         v_sqr_max_local = std::max(v_sqr_max_local, v_sqr);
         local_v_sqr[local_indx] += v_sqr; // add paticle energy to cell
+        local_v_x[local_indx] += v_x_temp; // first moment, for the mean drift in the cell
         number_part_cell_local[local_indx]++;
     }
     
@@ -525,6 +528,7 @@ void charged_particle::get_particle_diagnostics(const int thread_id, const int n
         this->v_sqr_max = std::max(this->v_sqr_max, v_sqr_max_local);
         for (int i = 0; i < number_cells; i++) {
             this->temperature[i] += local_v_sqr[i];
+            this->drift[i] += local_v_x[i];
         }
         for (int i = 0; i < number_cells+1; i++) {
             this->density[i] += local_density[i];
@@ -553,6 +557,7 @@ void charged_particle::write_diagnostics(const std::string& dir_name, int diag_n
     if (mpi_vars::mpi_rank == 0) {
         
         write_vector_to_binary_file(this->temperature, this->temperature.size(), dir_name + "/charged_particles/" + this->name + "/temperature/cell_temp_" + std::to_string(diag_number) + ".dat", 0);
+        write_vector_to_binary_file(this->drift, this->drift.size(), dir_name + "/charged_particles/" + this->name + "/velocity/cell_v_x_" + std::to_string(diag_number) + ".dat", 0);
 
         std::ofstream file(dir_name + "/charged_particles/" + this->name + "/momentum_diagnostics.dat", std::ios::app);
         if (!file) {
@@ -611,6 +616,7 @@ void charged_particle::write_diagnostics_average(const std::string& dir_name) co
     if (mpi_vars::mpi_rank == 0) {
         
         write_vector_to_binary_file(this->temperature, this->temperature.size(), dir_name + "/charged_particles/" + this->name + "/temperature/cell_temp_average.dat", 0);
+        write_vector_to_binary_file(this->drift, this->drift.size(), dir_name + "/charged_particles/" + this->name + "/velocity/cell_v_x_average.dat", 0);
         std::ofstream file(dir_name + "/charged_particles/" + this->name + "/momentum_diagnostics_average.dat");
         if (!file) {
             std::cerr << "Error opening file for momentum particle \n";
@@ -677,6 +683,7 @@ void charged_particle::reset_diagnostics(int thread_id) {
     #pragma omp for
     for (int i = 0; i < temp_size; i++){
         this->temperature[i] = 0.0;
+        this->drift[i] = 0.0;
         this->number_particles_per_cell[i] = 0;
     }
     #pragma omp for
@@ -752,6 +759,7 @@ void charged_particle::gather_mpi(){
     MPI_Allreduce(MPI_IN_PLACE, this->accum_wall_momentum_loss[1].data(), 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, this->accum_wall_loss, 2, mpi_vars::mpi_size_t_type, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, this->temperature.data(), this->temperature.size(), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, this->drift.data(), this->drift.size(), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, this->density.data(), this->density.size(), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); 
     MPI_Allreduce(MPI_IN_PLACE, this->number_particles_per_cell.data(), this->number_particles_per_cell.size(), mpi_vars::mpi_size_t_type, MPI_SUM, MPI_COMM_WORLD);
     this->average_temperature = 0.0;
@@ -760,6 +768,7 @@ void charged_particle::gather_mpi(){
         this->average_temperature += this->temperature[i];
         total_number_particles_local += this->number_particles_per_cell[i];
         this->temperature[i] = this->temperature[i] * this->mass /static_cast<double>(this->number_particles_per_cell[i])/ double(this->number_velocity_coordinates) / constants::elementary_charge; // convert to temperature     
+        this->drift[i] = this->drift[i] / static_cast<double>(this->number_particles_per_cell[i]); // mean v_x in the cell
     }
     this->average_temperature = this->average_temperature * this->mass / static_cast<double>(total_number_particles_local) / constants::elementary_charge / double(this->number_velocity_coordinates);
     this->average_density = static_cast<double>(total_number_particles_local);

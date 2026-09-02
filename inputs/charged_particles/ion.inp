@@ -1,12 +1,12 @@
-e : name of particle
--1 : charge of particle in units of elementary charge
-0.00054858 : mass in dalton
+ion : name of particle
+1 : charge of particle in units of elementary charge
+5.48634767053312 : mass in dalton
 2000 : number particles per thread
 100000000000000.0 : average initial total density (m^-3)
-1.0 : average initial temperature (eV)
+0.01 : average initial temperature (eV)
 2 : Initial factor of increase in particle array
 0 : EEDF type (0 = maxwellian)
 -4191.70271992157 : initial drift velocity in x-direction
 1 3 : number coordinates in space and velocity
-2 0.4 0.4 0 : dist type (0 uniform, 1 cosine, 2 sine), density alpha, drift alpha, match positions of previous species
+2 0.4 1.236 1 : dist type (0 uniform, 1 cosine, 2 sine), density alpha, drift alpha, match positions of previous species
 ENDFILE

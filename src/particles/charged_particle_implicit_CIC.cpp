@@ -15,19 +15,15 @@
 // potential/charge nodes sit half way between them, at cell centre c + 1/2.  A particle
 // therefore sees a field that varies linearly across its cell,
 //
-//     a(s) = [ dphi_left * (1 - s) + dphi_right * s ] * (q/m) / dx_cell ,   s = xi - cell in [0,1],
+//     a(s) = [ dphi_left * (1 - s) + dphi_right * s ] * (q/m) / dx_cell ,   s = xi - cell,
 //
-// working from the potential difference across each cell edge rather than the field itself, so
-// that the cell width used to reach logical coordinates cancels against the length each edge
-// value spans.  On a uniform grid the two are the same; on a stretched grid only this form
-// keeps the work done on the particles equal to the change in field energy.
+// working from the potential difference across each cell edge rather than the field itself,
+// so that the cell width used to reach logical coordinates cancels against the length each
+// edge value spans.  On a uniform grid the two are the same; on a stretched grid only this
+// form keeps the work done on the particles equal to the change in field energy.
 //
-// and deposits charge with the quadratic B-spline that is the integral of that linear
+// Charge is deposited with the quadratic B-spline that is the integral of that linear
 // weighting, which is what makes the scheme energy conserving.
-//
-// Each sub-step is solved with Picard iterations on the cell-centred (midpoint) position,
-// and is capped at a fraction of the local acceleration-gradient time scale so that the
-// iteration converges quickly.
 // ---------------------------------------------------------------------------------------
 
 namespace {
@@ -85,25 +81,96 @@ inline void deposit_quadratic(std::vector<double>& work_space, const double xi_p
     }
 }
 
-// Picard sub-step of one particle inside a single cell, in the local coordinate s in [0,1].
-// The acceleration is evaluated at the midpoint of the sub-step, so the position appears on
-// both sides of the update and is iterated to convergence.
-// Returns true when the particle reaches a cell edge within del_tau, in which case del_tau
-// is replaced by the time actually taken, s_f is set exactly onto the edge and
-// local_boundary reports which edge was reached (0 = left, 1 = right).
+// One sub-step of a particle inside a single cell, in the local coordinate s in [0,1].
+// Returns true when the particle reaches a cell edge within del_tau, in which case del_tau is
+// replaced by the time actually taken, s_f is set exactly onto the edge, and local_boundary
+// reports which edge was reached (0 = left, 1 = right).
+//
+// Whether an edge is reached is decided from the energy available at the start of the
+// sub-step, not from where the trajectory happens to end.  An endpoint test cannot see a
+// particle that leaves the cell and returns within the same sub-step, and would then let the
+// iteration below extrapolate this cell's field beyond its own boundary.
 inline bool CIC_sub_step(const double s_i, const double v_i, double& del_tau, double& s_f, double& v_f,
-    const double q_dphi_left, const double q_dphi_right, const double dx_cell, int& local_boundary) {
+    const CIC_cell_coefficients& cell, int& local_boundary) {
 
-    const double inv_dx = 1.0 / dx_cell;
-    // The caller passes q/m times the potential difference across each edge rather than the
-    // field, so the cell width divides out here; see build_mover_coefficients.
-    const double a_left = q_dphi_left * inv_dx;
-    const double a_right = q_dphi_right * inv_dx;
+    const double inv_dx = cell.inv_dx;
+    const double b_left = cell.q_dphi_left;
+    const double b_right = cell.q_dphi_right;
+    const double gradient = b_right - b_left;
+    const double v_i_sqr = v_i * v_i;
+
+    // Work done reaching s, in the units where v^2(s) = v_i^2 + work_to(s).  The cell width
+    // cancels because q_dphi is a potential difference rather than a field.
+    const double work_base = 2.0 * b_left * s_i + gradient * s_i * s_i;
+    auto work_to = [&](const double s) {
+        return 2.0 * b_left * s + gradient * s * s - work_base;
+    };
+
+    // Whether the particle has the energy to reach the edge at s_b without v^2 passing
+    // through zero on the way.  v^2 is quadratic in s, so when it is convex its minimum can
+    // sit inside the interval even with both endpoints positive.
+    auto can_reach = [&](const double s_b, double& v_sq_end) {
+        v_sq_end = v_i_sqr + work_to(s_b);
+        if (v_sq_end <= 0.0) { return false; }
+        if (gradient > 0.0) {
+            const double s_turn = -b_left / gradient;
+            if ((s_turn - s_i) * (s_b - s_i) > 0.0 && (s_turn - s_b) * (s_i - s_b) > 0.0) {
+                if (v_i_sqr + work_to(s_turn) <= 0.0) { return false; }
+            }
+        }
+        return true;
+    };
+
+    // Given a reachable edge, the crossing follows from the energy relation with the
+    // acceleration taken at the midpoint of the traverse, so no iteration is needed.
+    // Returns false when the crossing would take longer than the sub-step allows.
+    auto try_cross = [&](const double s_b, const int exit_sign, const double v_sq_end,
+                         double& t_out, double& v_out) {
+        v_out = exit_sign * std::sqrt(v_sq_end);
+        const double mid = 0.5 * (s_i + s_b);
+        const double accel_mid = (b_left * (1.0 - mid) + b_right * mid) * inv_dx;
+        // pick whichever form keeps the most significant digits
+        if (std::abs(v_out - v_i) > std::abs(v_out + v_i)) {
+            if (accel_mid == 0.0) { return false; }
+            t_out = (v_out - v_i) / accel_mid;
+        } else {
+            const double denom = inv_dx * (v_i + v_out);
+            if (denom == 0.0) { return false; }
+            t_out = 2.0 * (s_b - s_i) / denom;
+        }
+        return (t_out > 0.0 && t_out <= del_tau);
+    };
+
+    const int v_sign = (v_i > 0) - (v_i < 0);
+    if (v_sign != 0) {
+        double v_sq_end, t_cross, v_cross;
+        const double s_along = (v_sign > 0) ? 1.0 : 0.0;
+        if (can_reach(s_along, v_sq_end)) {
+            // Reaches the edge ahead if there is time; if not it stays in the cell and the
+            // iteration below resolves where.
+            if (try_cross(s_along, v_sign, v_sq_end, t_cross, v_cross)) {
+                s_f = s_along; v_f = v_cross; del_tau = t_cross;
+                local_boundary = int(s_along);
+                return true;
+            }
+        } else {
+            // It turns around inside the cell, so the only edge it can leave by is the one
+            // behind it.  This also covers a particle starting on an edge and returning to it.
+            const double s_opposite = (v_sign > 0) ? 0.0 : 1.0;
+            if (can_reach(s_opposite, v_sq_end)
+                && try_cross(s_opposite, -v_sign, v_sq_end, t_cross, v_cross)) {
+                s_f = s_opposite; v_f = v_cross; del_tau = t_cross;
+                local_boundary = int(s_opposite);
+                return true;
+            }
+        }
+    }
+
+    // Staying inside the cell: solve for the end position by Picard on the midpoint.
     double s_f_prev = s_i;
-    // first pass evaluates the field where the particle starts, and is deliberately left
-    // unclamped so that a particle leaving the cell always enters the iteration below
     double d_half = s_i;
-    double accel = a_left * (1.0 - d_half) + a_right * d_half;
+    double q_dphi = b_left * (1.0 - d_half) + b_right * d_half;
+    double accel = q_dphi * inv_dx;
     v_f = v_i + accel * del_tau;
     s_f = s_i + 0.5 * (v_i + v_f) * del_tau * inv_dx;
     int iteration = 0;
@@ -111,34 +178,13 @@ inline bool CIC_sub_step(const double s_i, const double v_i, double& del_tau, do
         if (++iteration > max_picard_iterations) { break; }
         s_f_prev = s_f;
         d_half = 0.5 * (s_i + s_f_prev);
-        accel = a_left * (1.0 - d_half) + a_right * d_half;
+        q_dphi = b_left * (1.0 - d_half) + b_right * d_half;
+        accel = q_dphi * inv_dx;
         v_f = v_i + accel * del_tau;
         s_f = s_i + 0.5 * (v_i + v_f) * del_tau * inv_dx;
         if (s_f > 1.0) { s_f = 1.0; } else if (s_f < 0.0) { s_f = 0.0; }
     }
-
-    if (s_f != 0.0 && s_f != 1.0) {
-        return false;
-    }
-    // Landed on a cell edge.  Take the velocity from the energy relation and back out the
-    // time the crossing actually needed, so that the sub-step ends exactly on the edge.
-    if (s_f != s_i) {
-        const double v_sqr = 2.0 * accel * (s_f - s_i) * dx_cell + v_i * v_i;
-        v_f = std::copysign(std::sqrt(std::max(v_sqr, 0.0)), v_i + v_f);
-        // pick the form which keeps the most significant digits
-        if (std::abs(v_f - v_i) > std::abs(v_f + v_i)) {
-            del_tau = (v_f - v_i) / accel;
-        } else {
-            del_tau = 2.0 * (s_f - s_i) * dx_cell / (v_i + v_f);
-        }
-    } else {
-        // turned around and came back to the edge it started on
-        if (accel == 0.0) { return false; } // at rest on an edge with no field, nothing happens
-        del_tau = -2.0 * v_i / accel;
-        v_f = -v_i;
-    }
-    local_boundary = int(s_f);
-    return true;
+    return false;
 }
 
 } // namespace
@@ -157,13 +203,10 @@ void charged_particle::deposit_particles_quadratic(const int thread_id, std::vec
 }
 
 
-// Push every particle over del_t with the given (time centred) field and deposit the
-// resulting charge onto the cell centred nodes.  Particle state is left untouched, this is
-// the residual evaluation driving the non-linear field solve.
+// Push every particle over del_t with the given (time centred) field and deposit the resulting charge onto the cell centred nodes.  Particle state is left untouched, this is the residual evaluation driving the non-linear field solve.
 void charged_particle::ES_push_deposit_ICIC(const int thread_id, double del_t, std::vector<double>& work_space,
-    const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+    const std::vector<CIC_cell_coefficients>& cells,
     const int left_boundary, const int right_boundary, const int number_cells) {
-
     const std::vector<double>& xi_local = this->xi[thread_id];
     const std::vector<double>& v_x_local = this->v_x[thread_id];
     const double t_tol = del_t * 1e-10;
@@ -184,11 +227,11 @@ void charged_particle::ES_push_deposit_ICIC(const int thread_id, double del_t, s
             int sub_step_count = 0;
             while (del_tau > t_tol) {
                 if (++sub_step_count > max_sub_steps) { break; }
-                if (del_tau > del_tau_min[cell]) { del_tau = del_tau_min[cell]; }
+                if (del_tau > cells[cell].del_tau_min) { del_tau = cells[cell].del_tau_min; }
                 double s_f;
                 int local_boundary = 0;
                 const bool future_boundary_bool = CIC_sub_step(xi_i - double(cell), v_x_i, del_tau, s_f, v_x_f,
-                    a_node[cell], a_node[cell+1], dx_cells[cell], local_boundary);
+                    cells[cell], local_boundary);
                 xi_f = double(cell) + s_f;
                 if (future_boundary_bool) {
                     const int xi_boundary = cell + local_boundary;
@@ -248,12 +291,10 @@ void charged_particle::ES_push_deposit_ICIC(const int thread_id, double del_t, s
 }
 
 
-// Final push over del_t once the field has converged.  Updates particle state, removes
-// particles absorbed at the walls and accumulates the wall loss diagnostics.
+// Final push over del_t once the field has converged.  Updates particle state, removes particles absorbed at the walls and accumulates the wall loss diagnostics.
 void charged_particle::ES_push_ICIC(const int thread_id, double del_t, int& number_sub_steps,
-    const std::vector<double>& a_node, const std::vector<double>& del_tau_min, const std::vector<double>& dx_cells,
+    const std::vector<CIC_cell_coefficients>& cells,
     const int left_boundary, const int right_boundary, const int number_cells) {
-
     std::vector<double>& xi_local = this->xi[thread_id];
     std::vector<double>& v_x_local = this->v_x[thread_id];
     const bool use_vy = (this->number_velocity_coordinates > 1);
@@ -270,6 +311,7 @@ void charged_particle::ES_push_ICIC(const int thread_id, double del_t, int& numb
             const double v_y = use_vy ? this->v_y[thread_id][part_indx] : 0.0;
             const double v_z = use_vz ? this->v_z[thread_id][part_indx] : 0.0;
             const double del_t_local = (del_t_array == nullptr) ? del_t : (*del_t_array)[part_indx - start_indx];
+            // nudge off an exact node so the cell is picked along the direction of travel
             int cell = int(xi_i + ((v_x_i > 0) - (v_x_i < 0)) * 1e-12);
             if (cell < 0) { cell = 0; }
             if (cell > number_cells-1) { cell = number_cells-1; }
@@ -281,11 +323,11 @@ void charged_particle::ES_push_ICIC(const int thread_id, double del_t, int& numb
             while (del_tau > t_tol) {
                 if (++sub_step_count > max_sub_steps) { break; }
                 number_sub_steps++;
-                if (del_tau > del_tau_min[cell]) { del_tau = del_tau_min[cell]; }
+                if (del_tau > cells[cell].del_tau_min) { del_tau = cells[cell].del_tau_min; }
                 double s_f;
                 int local_boundary = 0;
                 const bool future_boundary_bool = CIC_sub_step(xi_i - double(cell), v_x_i, del_tau, s_f, v_x_f,
-                    a_node[cell], a_node[cell+1], dx_cells[cell], local_boundary);
+                    cells[cell], local_boundary);
                 xi_f = double(cell) + s_f;
                 if (future_boundary_bool) {
                     const int xi_boundary = cell + local_boundary;

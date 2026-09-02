@@ -1,3 +1,4 @@
+#include <cmath>
 #include "non_linear_solvers/AA_solver.hpp"
 #include "globals/mpi_vars.hpp"
 #include <iomanip>
@@ -25,6 +26,11 @@ AA_solver::AA_solver(double beta, double eps_r, double eps_a, int max_iterations
     this->accum_iterations_count = 0;
     this->accum_residual_norm = 0.0;
     this->solver_time = 0.0;
+    this->max_iterations_used = 0;
+    this->non_converged_count = 0;
+    this->worst_residual = 0.0;
+    this->warnings_printed = 0;
+    this->convergence_tolerance = eps_a * std::sqrt(double(number_unknowns));
 }
 
 void AA_solver::initialize_diagnostic_files(const std::string& filename) const {
@@ -56,7 +62,7 @@ void AA_solver::initialize_diagnostic_files(const std::string& filename) const {
         }
 
         // Write header (optional)
-        file << "solver time (s), residual norm, number iterations \n";
+        file << "solver time (s), accum residual norm, accum iterations, max iterations in one step, steps not converged, worst final residual \n";
 
         file.close();
     }

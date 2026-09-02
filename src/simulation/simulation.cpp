@@ -89,6 +89,10 @@ void simulation::initialize_diagnostic_files() {
                     std::cerr << "Save directory not successfully created!" << std::endl;
                     MPI_Abort(MPI_COMM_WORLD, 1);
                 }
+                if (!createDirectory(folder_name + "/charged_particles/" + this->charged_particle_list[i].name + "/velocity")) {
+                    std::cerr << "Save directory not successfully created!" << std::endl;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
                 if (!createDirectory(folder_name + "/charged_particles/" + this->charged_particle_list[i].name + "/phase_space")) {
                     std::cerr << "Save directory not successfully created!" << std::endl;
                     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -211,6 +215,7 @@ void simulation::initialize_diagnostic_files() {
 void simulation::setup() {
     // create openmp parallel, with thread id passed around
     int scheme_type = 0;
+    int deterministic_seed = 0;
     double del_t_temp, del_t_fraction;
     if (mpi_vars::mpi_rank == 0) {
         std::ifstream file("../inputs/initial_setup.inp");
@@ -253,6 +258,15 @@ void simulation::setup() {
         std::string rest;
         iss >> rest;
         this->restarted_simulation = (rest == "yes" || rest == "Yes");
+        // Optional trailing line, absent in older input files: 0 draws a fresh seed, and any
+        // value >= 1 selects a reproducible RNG stream.  A fixed stream lets a specific
+        // non-converging step be re-examined, and different streams give repeats of the same
+        // case that differ only in the random sequence.
+        deterministic_seed = 0;
+        if (std::getline(file, line)) {
+            std::istringstream seed_iss(line);
+            if (!(seed_iss >> deterministic_seed)) { deterministic_seed = 0; }
+        }
         file.close();
         if (scheme_type == 0) {
             std::cout << "Scheme type: 0 (MC-PIC)" << std::endl;
@@ -268,6 +282,7 @@ void simulation::setup() {
         }
     }
     MPI_Bcast(&scheme_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&deterministic_seed, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&del_t_temp, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&del_t_fraction, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&this->simulation_time, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
@@ -277,7 +292,7 @@ void simulation::setup() {
     MPI_Bcast(&this->number_diagnostics, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&this->restarted_simulation, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
     this->scheme_type = scheme_type;
-    initialize_pcg(false); // Initialize the PCG RNG with a non-deterministic seed
+    initialize_pcg(deterministic_seed);
     // Generate objects serially except when needed
     this->world = create_domain_from_file("../inputs/geometry.inp", scheme_type);
     this->world->print_out();

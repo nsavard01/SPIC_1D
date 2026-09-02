@@ -12,13 +12,13 @@ static const uint64_t increment = 1442695040888963407ULL;
 static uint64_t pcg_state;
 #pragma omp threadprivate(pcg_state)
 
-void initialize_pcg(bool pre_determined) {
+void initialize_pcg(int seed_stream) {
     uint64_t seed;
     int thread_id;
     if (mpi_vars::mpi_rank == 0) {
         std::cout << "----------------------------------------" << std::endl;
-        if (pre_determined) {
-            std::cout << "Using pre-determined seed for PCG RNG." << std::endl;
+        if (seed_stream > 0) {
+            std::cout << "Using pre-determined seed stream " << seed_stream << " for PCG RNG." << std::endl;
         } else {
             std::cout << "Using random seed for PCG RNG." << std::endl;
         }
@@ -28,8 +28,11 @@ void initialize_pcg(bool pre_determined) {
     {
     
         thread_id = omp_get_thread_num();
-        if (pre_determined) {
-            seed = thread_id*multiplier + increment;
+        if (seed_stream > 0) {
+            // Streams are separated by more thread slots than any run will use, so no two
+            // streams ever share a state.  Stream 1 reproduces the original fixed seeding.
+            seed = (static_cast<uint64_t>(thread_id)
+                    + static_cast<uint64_t>(seed_stream - 1) * 1024ULL) * multiplier + increment;
         }
         else {
             thread_local std::random_device rd;

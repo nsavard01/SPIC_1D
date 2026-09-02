@@ -53,7 +53,10 @@ void non_linear_solver::write_diagnostics(const std::string& filename) const {
         file << std::scientific << std::setprecision(8);
         file << this->solver_time << "\t"
         << this->accum_residual_norm << "\t"
-        << this->accum_iterations_count <<
+        << this->accum_iterations_count << "\t"
+        << this->max_iterations_used << "\t"
+        << this->non_converged_count << "\t"
+        << this->worst_residual <<
         "\n";
 
         file.close();

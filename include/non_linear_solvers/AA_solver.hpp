@@ -4,6 +4,7 @@
 #include <functional>
 #include "globals/mpi_vars.hpp"
 #include <iostream>
+#include <algorithm>
 
 
 class AA_solver : public non_linear_solver { // Anderson accelerated 
@@ -44,6 +45,9 @@ public:
             this->norm_residual[0] = std::sqrt(this->norm_residual[0]);   
         }
         #pragma omp barrier
+        #pragma omp master
+        { this->residual_history.clear(); }
+        #pragma omp barrier
         double eps_tol = this->eps_r * this->norm_residual[0] + this->eps_a * std::sqrt(double(this->number_unknowns));
         int iter, index, m_k;
         for (iter = 1; iter< this->max_iterations; iter++) {
@@ -65,6 +69,7 @@ public:
                     this->norm_residual[index] += diff * diff; // accumulate norm
                 }
                 this->norm_residual[index] = std::sqrt(this->norm_residual[index]);
+                this->residual_history.push_back(this->norm_residual[index]);
             } 
             #pragma omp barrier
             
@@ -131,6 +136,62 @@ public:
             this->number_iterations = iter + 1;
             this->accum_residual_norm += this->norm_residual[index];
             this->accum_iterations_count += this->number_iterations;
+            // The loop above exits either by meeting the tolerance or by running out of
+            // iterations, and the caller cannot tell which, so record it here.
+            const double final_residual = this->norm_residual[index];
+            if (this->number_iterations > this->max_iterations_used) {
+                this->max_iterations_used = this->number_iterations;
+            }
+            if (final_residual > this->worst_residual) {
+                this->worst_residual = final_residual;
+            }
+            if (iter >= this->max_iterations) {
+                this->non_converged_count++;
+                if (mpi_vars::mpi_rank == 0 && this->warnings_printed < 3) {
+                    this->warnings_printed++;
+                    // Dump the residual history.  Geometric decay then a plateau means the map
+                    // has a noise floor; oscillation or growth means it is simply not
+                    // contractive at this time step.
+                    // Which unknowns carry the stalled residual?  A few isolated cells point
+                    // at particular particles; a spread residual points at the map as a whole.
+                    std::vector<int> order(this->number_unknowns);
+                    for (int i = 0; i < this->number_unknowns; ++i) { order[i] = i; }
+                    const std::vector<double>& res_vec = this->residual_k[index];
+                    std::sort(order.begin(), order.end(), [&res_vec](int a, int b) {
+                        return std::abs(res_vec[a]) > std::abs(res_vec[b]); });
+                    double res_total = 0.0;
+                    for (int i = 0; i < this->number_unknowns; ++i) { res_total += res_vec[i] * res_vec[i]; }
+                    double top_five = 0.0;
+                    std::cout << "stalled residual by cell:";
+                    for (int k = 0; k < 5 && k < this->number_unknowns; ++k) {
+                        top_five += res_vec[order[k]] * res_vec[order[k]];
+                        std::cout << " cell " << order[k] << " = " << res_vec[order[k]];
+                    }
+                    std::cout << "   (top 5 hold " << 100.0 * top_five / res_total
+                              << "% of the squared residual)" << std::endl;
+                    std::cout << "residual vector:";
+                    for (int i = 0; i < this->number_unknowns; ++i) {
+                        std::cout << " " << res_vec[i];
+                    }
+                    std::cout << std::endl;
+                    std::cout << "residual history:";
+                    for (size_t h = 0; h < this->residual_history.size(); ++h) {
+                        if (h < 12 || h + 10 >= this->residual_history.size()) {
+                            std::cout << " " << this->residual_history[h];
+                        } else if (h == 12) {
+                            std::cout << " ...";
+                        }
+                    }
+                    std::cout << std::endl;
+                    std::cout << "Non-linear solver did not converge: residual " << final_residual
+                              << " against tolerance " << eps_tol << " after " << this->max_iterations
+                              << " iterations." << std::endl;
+                    if (this->warnings_printed == 20) {
+                        std::cout << "Further non-convergence warnings suppressed, see "
+                                  << "non_linear_solver_diagnostics.dat for the running count." << std::endl;
+                    }
+                }
+            }
         }
 
     }

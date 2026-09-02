@@ -1,0 +1,1164 @@
+#!/usr/bin/env python3
+"""
+Error, cost and convergence of ICIC and explicit PIC on the IASW problem.
+
+Every point of every sweep is a single run repeated over 10 independent RNG streams, so
+each point carries a measured seed-to-seed scatter rather than being one draw.  The error
+is the metric of the Comment's Eq. 4, at the final time t = 3000/omega_pe,
+
+    sigma_RMS = sqrt( sum_i ((n_i - n_ref_i) / n_ref_i)^2 / N_x )
+
+with the reference linearly interpolated onto each run's own grid.  Periodic, so the
+interpolation wraps.  The same treatment is applied to every scheme, so whatever bias it
+carries is common to all of them.
+
+    from fig1_error import *
+    baseline_check()      # the two ultra-resolved baselines: convergence and mutual agreement
+    table()               # every point, mean and scatter over the seed ensemble
+    error_figure()        # error vs particles per cell
+    timing_figure()       # error vs wall time
+    profile_figure()      # final density profiles
+    decomposition()       # random vs systematic error, and what ensemble averaging buys
+    save_all()            # write every figure next to the runs
+"""
+import os, sys
+import numpy as np
+import matplotlib
+# Prefer QtAgg so figures open in their own window.  Probe the Qt binding first, because
+# matplotlib.use() defers the import and so cannot report an unusable backend.  Falls back
+# silently where there is no GUI, and force=True overrides an inline backend that a Jupyter
+# or VS Code session has already installed.
+try:
+    from matplotlib.backends import backend_qtagg as _qt_probe  # noqa: F401
+    matplotlib.use("QtAgg", force=True)
+except Exception:
+    pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import iasw_analysis
+from iasw_analysis import periodic_interp, get, _plt
+
+# ------------------------------------------------------------------ configuration
+# Runs are located through iasw_analysis.BASE_DIRS, so this file needs no editing when the
+# same directories are reached over a different mount.
+#
+# The two ultra-resolved baselines: 2048 uniform cells, 20000 PPC, fixed seed stream 1, each
+# at a time step small enough to be converged (baseline_check() reports by how much).  They
+# agree with each other far more closely than any point of the sweep, so the choice between
+# them does not move the figure -- which answers the objection that referencing an implicit
+# run to an explicit solution conflates scheme error with particle error.
+REFERENCE = 'Exp_IASW_Chacon2013_32Threads_20000PPC_2048Cells_0p05delT'
+REFERENCE_ICIC = 'ICIC_IASW_Chacon2013_32Threads_20000PPC_2048Cells_0p2delT'
+REFERENCE_DT_CHECK = {REFERENCE: 'Exp_IASW_Chacon2013_32Threads_20000PPC_2048Cells_0p025delT',
+                      REFERENCE_ICIC: 'ICIC_IASW_Chacon2013_32Threads_20000PPC_2048Cells_0p1delT'}
+
+PPCS = [125, 250, 500, 1000, 2000]
+SEEDS = tuple(range(1, 11))
+
+# What counts as the cost of a run.  'physics' is the particle push and deposit plus the
+# field solve, which is what the schemes should be compared on; 'total' adds diagnostics and
+# file output, which are 9.5% of an ICIC run but only 1.3% of an explicit one and so bias
+# the comparison by about eight percentage points.  Everything left out of 'physics' for the
+# implicit scheme -- boundary potentials, the field construction, the mover coefficients, and
+# the Anderson least-squares -- is O(number of cells), the same order as the tridiagonal
+# solve that the field timer measures at 0.01 s out of 62 s, so the omission is immaterial.
+COST = 'physics'
+SERIES = [
+    ('ICIC, 64 adaptive cells, $\\varepsilon_a=10^{-6}$',
+     'ICIC_IASW_Chacon2013_4Threads_%dPPC_64Cells_InvSine_2delT_smooth_seed%02d',
+     dict(color='tab:blue', marker='o', ls='-')),
+    ('ICIC, 64 adaptive cells, $\\varepsilon_a=10^{-3}$',
+     'ICIC_IASW_Chacon2013_4Threads_%dPPC_64Cells_InvSine_2delT_smooth_eps3_seed%02d',
+     dict(color='tab:cyan', marker='D', ls='--')),
+    ('Explicit, 512 cells, $\\Delta t=0.1/\\omega_{pe}$',
+     'Exp_IASW_Chacon2013_4Threads_%dPPC_512Cells_0p1delT_seed%02d',
+     dict(color='tab:orange', marker='o', ls='-')),
+    ('Explicit, 400 cells, $\\Delta t=0.2/\\omega_{pe}$',
+     'Exp_IASW_Chacon2013_4Threads_%dPPC_400Cells_0p2delT_seed%02d',
+     dict(color='tab:green', marker='o', ls='-')),
+]
+
+# Everything Referee 1 asked to be stated alongside Fig. 1.
+RUN_PARAMETERS = [
+    ('scheme',        'ICIC',       'ICIC',       'explicit MC', 'explicit MC'),
+    ('cells',         '64',         '64',         '512',         '400'),
+    ('mesh',          'inverse sine', 'inverse sine', 'uniform',  'uniform'),
+    ('$\\Delta t\\,\\omega_{pe}$', '2', '2',   '0.1',         '0.2'),
+    ('$\\varepsilon_a$', '$10^{-6}$', '$10^{-3}$', 'n/a',      'n/a'),
+    ('smoothing',     'on',         'on',         'n/a',         'n/a'),
+    ('threads',       '4',          '4',          '4',           '4'),
+    ('loading',       'quiet start, matched', 'same', 'same',     'same'),
+    ('realisations',  '10 RNG streams', 'same',   'same',        'same'),
+]
+
+
+def save_dir():
+    """Where save_all() writes.  The last configured base directory that exists."""
+    for d in reversed(iasw_analysis.BASE_DIRS):
+        if os.path.isdir(d):
+            base = os.path.basename(d)
+            return os.path.dirname(d) if base in ('seed_study', 'resolution') else d
+    return '.'
+
+# ---------------------------------------------------------------------- helpers
+
+def final_density(run, species='ion'):
+    return run.density(species, run.n_dumps() - 1)
+
+
+def _on_grid(run, ref, species='ion'):
+    """Final density of run, brought onto ref's abscissa if the grids differ."""
+    n, x = final_density(run, species), run.field_x
+    if len(x) == len(ref.field_x) and np.allclose(x, ref.field_x):
+        return n
+    if COMPARISON == 'restrict':
+        return restrict(run, ref, species)
+    return periodic_interp(x, n, ref.field_x, run.length)
+
+
+def cost(run):
+    """Seconds of work attributed to one run, per the COST setting."""
+    if COST == 'total':
+        return run.wall
+    return run.field_time + run.particle_time
+
+
+def _rms(a, b):
+    """RMS of (a - b) / b, the metric of Eq. 4."""
+    return float(np.sqrt(np.mean(((a - b) / b) ** 2)))
+
+
+def _cell_edges_from_grid(run):
+    if len(run.grid) == run.number_cells + 1:
+        return run.grid
+    half = 0.5 * np.diff(np.append(run.grid, run.grid[0] + run.length))
+    return np.append(run.grid - half, run.grid[-1] + half[-1])
+
+
+def _logical(run, x):
+    """Logical coordinate of a physical position on a run's mesh, wrapped periodically."""
+    edges = _cell_edges_from_grid(run)
+    return np.interp(np.mod(x - edges[0], run.length) + edges[0], edges,
+                     np.arange(len(edges), dtype=float))
+
+
+_RESTRICT_CACHE = {}
+QUADRATURE_PER_CELL = 128      # fine samples per coarse cell used for the restriction integral
+
+
+def restrict(ref, run, species='ion'):
+    """The reference coarse-grained onto a run's mesh with that run's own deposit kernel.
+
+    A cell value reported by the coarse run is not a point sample of the solution: it is the
+    deposit-weighted average of the particles near that node.  Interpolating the fine
+    reference to the coarse abscissa compares an average against a point value, and the gap
+    between the two is largest exactly where the profile has curvature, which here is the
+    shock.  Restricting instead asks what the coarse run would report with infinitely many
+    particles,
+
+        n_coarse[i] = integral n(x) W_i(xi(x)) dx / integral W_i(xi(x)) dx
+
+    with W the linear hat for a nodal layout and the quadratic B-spline for the cell centred
+    one.  Being a normalised average it reproduces a constant exactly, and it is applied to
+    the 20000 PPC reference rather than to the measurement, so unlike the shift of Eq. 5 it
+    smooths nothing noisy.  The integral is a Riemann sum on a uniform abscissa, where the
+    spacing cancels between numerator and denominator; QUADRATURE_PER_CELL sets its
+    resolution, and the result is converged in RMS to better than 1e-5 at 128.
+    """
+    key = (ref.name, species, run.grid.tobytes(), QUADRATURE_PER_CELL)
+    if key in _RESTRICT_CACHE:
+        return _RESTRICT_CACHE[key]
+    nc = run.number_cells
+    x0 = ref.field_x[0]
+    fine = np.linspace(x0, x0 + ref.length, nc * QUADRATURE_PER_CELL, endpoint=False)
+    n = periodic_interp(ref.field_x, final_density(ref, species), fine, ref.length)
+    xi = _logical(run, fine)
+    centred = run.layout == 'centred'
+    targets = (np.arange(nc) + 0.5) if centred else np.arange(nc + 1.0)
+    out = np.empty(len(targets))
+    for i, c in enumerate(targets):
+        u = np.abs(np.mod(xi - c + 0.5 * nc, nc) - 0.5 * nc)
+        if centred:                                # quadratic B-spline
+            w = np.where(u <= 0.5, 0.75 - u * u,
+                         np.where(u <= 1.5, 0.5 * (1.5 - u) ** 2, 0.0))
+        else:                                      # linear hat
+            w = np.clip(1.0 - u, 0.0, None)
+        out[i] = np.dot(w, n) / w.sum()
+    _RESTRICT_CACHE[key] = out
+    return out
+
+
+# How the reference is brought onto a run's coarser mesh.  'interpolate' point-samples it at
+# the run's abscissa, which is the plain reading of Eq. 4 and is what every figure here uses.
+# 'restrict' instead applies the run's own deposit kernel; see restrict() for why that is
+# arguably the better comparison and for what it changes, which is a per-series offset in the
+# systematic error and nothing in the particle-number scaling.
+COMPARISON = 'interpolate'
+
+
+def _ref_on(run, ref, species='ion'):
+    """The reference brought onto a run's own grid, per the COMPARISON setting."""
+    if COMPARISON == 'restrict':
+        return restrict(ref, run, species)
+    return periodic_interp(ref.field_x, final_density(ref, species), run.field_x, ref.length)
+
+# --------------------------------------------------------------- shift metrics
+# Eq. 5 of the Comment minimises the RMS error over a rigid shift of the profile in the
+# logical coordinate,
+#
+#   sigma_opt = min_{|h| < h0} sqrt( sum_i ((n(xi_i + h) - n_ref(xi_i)) / n_ref(xi_i))^2 / N_x )
+#
+# with h0 = L_x/100 and n evaluated by linear interpolation.  The samples are equispaced in
+# the logical index, so a shift of h is a shift of s = h * N_x / L_x cells and the whole
+# minimisation is index arithmetic with a periodic wrap.
+#
+# Referee 1 points out that linear interpolation at a fractional offset averages
+# neighbouring samples, which is a low-pass filter: at half a cell it multiplies
+# uncorrelated noise by 1/sqrt(2).  A noisy but unshifted profile is therefore rewarded for
+# reporting a shift of about half a cell, and the error drops for no physical reason.  A
+# spectral shift rotates the phase of every mode and leaves every amplitude alone, so it
+# does not.  Both are provided: 'linear' is Eq. 5 verbatim, 'fourier' is unbiased, and
+# noise_bias() measures the artefact directly.
+
+SHIFT_CELLS_PER_L = 1.0 / 100.0   # h0 = L_x/100, expressed as a fraction of the domain
+
+
+def _shift_linear(n, s):
+    """Sample n at index i + s with a periodic wrap, by linear interpolation."""
+    N = len(n)
+    i = np.arange(N) + s
+    lo = np.floor(i).astype(int)
+    f = i - lo
+    return n[lo % N] * (1.0 - f) + n[(lo + 1) % N] * f
+
+
+def _shift_fourier(n, s):
+    """Sample n at index i + s with a periodic wrap, by a spectral shift."""
+    N = len(n)
+    k = np.fft.rfftfreq(N, d=1.0 / N)
+    return np.fft.irfft(np.fft.rfft(n) * np.exp(2j * np.pi * k * s / N), n=N)
+
+
+def shifted_error(n, n_ref, mode='linear', s0=None, samples=801):
+    """Minimum RMS relative error over a rigid shift.  Returns (error, shift in cells)."""
+    N = len(n)
+    if s0 is None:
+        s0 = N * SHIFT_CELLS_PER_L
+    shift = _shift_fourier if mode == 'fourier' else _shift_linear
+
+    def rms(s):
+        return _rms(shift(n, s), n_ref)
+
+    grid = np.linspace(-s0, s0, samples)
+    vals = np.array([rms(s) for s in grid])
+    j = int(np.argmin(vals))
+    if 0 < j < len(grid) - 1:                     # parabolic refinement of the minimum
+        y0, y1, y2 = vals[j - 1], vals[j], vals[j + 1]
+        denom = y0 - 2 * y1 + y2
+        if denom > 0:
+            s = grid[j] + 0.5 * (y0 - y2) / denom * (grid[1] - grid[0])
+            if rms(s) < vals[j]:
+                return rms(s), float(s)
+    return float(vals[j]), float(grid[j])
+
+
+def run_metrics(run, ref, species='ion'):
+    """All three metrics for one run: unshifted, Eq. 5 verbatim, and the spectral shift."""
+    n, n_ref = final_density(run, species), _ref_on(run, ref, species)
+    out = {'rms': _rms(n, n_ref)}
+    out['lin'], out['s_lin'] = shifted_error(n, n_ref, 'linear')
+    out['fft'], out['s_fft'] = shifted_error(n, n_ref, 'fourier')
+    return out
+
+
+def noise_bias(ref_name=None, amplitudes=(0.02, 0.05, 0.10, 0.20), trials=20, seed=1):
+    """Referee 1's test of Eq. 5: add white noise to a profile and do not move it.
+
+    A norm-preserving shift reports no displacement and no error reduction.  Linear
+    interpolation instead smooths the noise, so it reports both.
+    """
+    r = get(ref_name or 'ICIC_IASW_Chacon2013_32Threads_20000PPC_64Cells_InvSine_0p2delT_smooth')
+    n0 = final_density(r, 'ion')
+    rng = np.random.default_rng(seed)
+    print('white noise added to an unshifted %d-cell profile, %d trials each' % (len(n0), trials))
+    print('%8s | %-28s | %-28s' % ('noise', 'Eq. 5, linear interp', 'spectral shift'))
+    print('%8s | %10s %9s %7s | %10s %9s %7s'
+          % ('rel rms', 'error', '|s| cells', 'drop %', 'error', '|s| cells', 'drop %'))
+    for a in amplitudes:
+        rec = []
+        for _ in range(trials):
+            n = n0 * (1.0 + a * rng.standard_normal(len(n0)))
+            base = _rms(n, n0)
+            el, sl = shifted_error(n, n0, 'linear')
+            ef, sf = shifted_error(n, n0, 'fourier')
+            rec.append((base, el, abs(sl), ef, abs(sf)))
+        b, el, sl, ef, sf = np.mean(rec, axis=0)
+        print('%8.3f | %10.4f %9.3f %7.1f | %10.4f %9.3f %7.1f'
+              % (b, el, sl, 100 * (1 - el / b), ef, sf, 100 * (1 - ef / b)))
+
+# ------------------------------------------------------------- seed ensemble
+# Three quantities are separated at every point:
+#   err   error of one run against the baseline, averaged over the seed ensemble.  Contains
+#         the systematic error of scheme and mesh together with the run's particle noise.
+#   pair  RMS difference between two independent realisations, divided by sqrt(2) to put it
+#         on a single-run footing.  Everything systematic cancels, so this is the particle
+#         noise alone, with no contribution from the baseline at all.
+#   ens   error of the profile averaged over all seeds, which is what the original paper
+#         reported and what the Comment argues carries a smoothing bias.
+
+
+def seed_runs(pattern, ppc):
+    """Every completed realisation of one case."""
+    out = []
+    for s in SEEDS:
+        try:
+            r = get(pattern % (ppc, s))
+        except (KeyError, IndexError):
+            continue
+        if r.n_dumps() >= r.num_diag:
+            out.append(r)
+    return out
+
+
+def seed_point(runs, ref, species='ion'):
+    """Statistics of one (series, PPC) point over its seed ensemble."""
+    if not runs:
+        return None
+    n_ref = _ref_on(runs[0], ref, species)
+    dens = [final_density(r, species) for r in runs]
+    err = np.array([_rms(n, n_ref) for n in dens])
+    fft = np.array([shifted_error(n, n_ref, 'fourier')[0] for n in dens])
+    # Normalised by the reference, not by the second realisation, so this sits on the same
+    # footing as Eq. 4; a noisy denominator would inflate it.
+    pair = [float(np.sqrt(np.mean(((dens[i] - dens[j]) / n_ref) ** 2))) / np.sqrt(2.0)
+            for i in range(len(dens)) for j in range(i + 1, len(dens))]
+    sd = (lambda a: float(a.std(ddof=1)) if len(a) > 1 else 0.0)
+    return {'n': len(runs),
+            'err': float(err.mean()), 'sd': sd(err),
+            'lo': float(err.min()), 'hi': float(err.max()),
+            'fft': float(fft.mean()), 'fft_sd': sd(fft),
+            'pair': float(np.mean(pair)) if pair else float('nan'),
+            'ens': _rms(np.mean(dens, axis=0), n_ref),
+            'wall': float(np.mean([cost(r) for r in runs if r.wall]))}
+
+
+def series_reference(pattern):
+    """The ultra-resolved solution a series is measured against.
+
+    Each scheme is referenced to its own ultra-resolved run, so that neither scheme is
+    implicitly treated as the standard the other is judged by.  The two references agree with
+    each other to 0.003, so this choice moves any point by at most a few percent;
+    reference_sensitivity() reports by how much.
+    """
+    return REFERENCE_ICIC if pattern.startswith('ICIC') else REFERENCE
+
+
+def collect(species='ion', reference=None):
+    """Every series against its own reference, as (label, style, [(ppc, stats), ...]).
+
+    Passing `reference` overrides that and measures every series against the one named.
+    """
+    rows = []
+    for label, pattern, style in SERIES:
+        ref = get(reference or series_reference(pattern))
+        pts = [(ppc, seed_point(seed_runs(pattern, ppc), ref, species)) for ppc in PPCS]
+        rows.append((label, style, [(p, d) for p, d in pts if d]))
+    return rows
+
+
+def _plain(label):
+    """A legend label rendered for a plain text table."""
+    for a, b in (('$', ''), ('\\Delta t', 'dt'), ('\\omega_{pe}', 'w_pe'),
+                 ('\\varepsilon_a', 'eps_a'), ('10^{-6}', '1e-6'), ('10^{-3}', '1e-3')):
+        label = label.replace(a, b)
+    return label
+
+
+def _arrays(pts, *keys):
+    return [np.array([d[k] for _, d in pts], float) for k in keys]
+
+
+def table(species='ion', reference=None):
+    """Every point with its seed-to-seed scatter and the error decomposition."""
+    print('%s density error at t = 3000/w_pe\n' % species)
+    for (label, _, pts), (_, pattern, _) in zip(collect(species, reference), SERIES):
+        print(_plain(label))
+        print('   reference: %s' % (reference or series_reference(pattern)))
+        print('   %5s %3s | %8s %8s %8s %8s | %8s %8s %8s | %8s'
+              % ('PPC', 'n', 'err', 'sd', 'min', 'max', 'shifted', 'pair', 'ens.avg',
+                 'cost(s)' if COST != 'total' else 'wall(s)'))
+        for ppc, d in pts:
+            print('   %5d %3d | %8.4f %8.4f %8.4f %8.4f | %8.4f %8.4f %8.4f | %8.1f'
+                  % (ppc, d['n'], d['err'], d['sd'], d['lo'], d['hi'],
+                     d['fft'], d['pair'], d['ens'], d['wall']))
+        print()
+    print('err      single run against the baseline, mean over the seed ensemble')
+    print('sd       seed-to-seed standard deviation of that error')
+    print('shifted  the same after removing the best rigid phase shift, spectrally')
+    print('pair     RMS difference between two realisations / sqrt(2): particle noise alone')
+    print('ens.avg  error of the profile averaged over all seeds')
+    print('cost     particle push and deposit plus the field solve, diagnostics excluded'
+          if COST != 'total' else 'wall     total run time, diagnostics included')
+
+def solver_stats():
+    """Anderson iterations and convergence, for the implicit series only.
+
+    The Comment argues that run-to-run variability in the nonlinear convergence of
+    under-resolved implicit solves can introduce a systematic error that ensemble averaging
+    does not remove.  That is only possible if steps are actually failing to converge, so
+    the failure count is the thing to look at.
+    """
+    print('%-46s %5s | %7s %8s %7s %10s %10s'
+          % ('series', 'PPC', 'steps', 'AA/step', 'max AA', 'not conv.', 'worst res'))
+    for label, pattern, _ in SERIES:
+        if not pattern.startswith('ICIC'):
+            continue
+        for ppc in PPCS:
+            runs = seed_runs(pattern, ppc)
+            if not runs:
+                continue
+            rows = []
+            for r in runs:
+                d = np.atleast_2d(np.genfromtxt(
+                    os.path.join(r.path, 'non_linear_solver_diagnostics.dat'), skip_header=1))[-1]
+                steps = max(int(round(r.time[-1] / r.del_t)), 1)
+                rows.append((steps, d[2] / steps, d[3], d[4], d[5]))
+            steps, per, mx, bad, res = np.mean(rows, axis=0)
+            print('%-46s %5d | %7d %8.2f %7.0f %10.1f %10.2e'
+                  % (_plain(label), ppc, steps, per, mx, bad, res))
+        print()
+    print('AA/step    Anderson iterations per time step, averaged over the seed ensemble')
+    print('not conv.  time steps that hit the iteration cap, averaged over the ensemble')
+
+
+# ---------------------------------------------------------------- baselines
+
+def baseline_check(species='ion', verbose=True):
+    """How far apart the two ultra-resolved baselines are, and whether each is converged.
+
+    Returns the cross-scheme floor: no point of a sweep can be read below it.
+    """
+    exp, icic = get(REFERENCE), get(REFERENCE_ICIC)
+    out = {}
+    for name, r in (('explicit', exp), ('ICIC', icic)):
+        chk = get(REFERENCE_DT_CHECK[r.name])
+        out[name + '_dt'] = _rms(_on_grid(chk, r, species), final_density(r, species))
+        x, n = r.field_x, final_density(r, species)
+        g = np.abs(np.gradient(n, x))
+        k = int(np.argmax(g))
+        d = g[k - 1] - 2 * g[k] + g[k + 1]
+        out[name + '_shock'] = x[k] + (0.5 * (g[k - 1] - g[k + 1]) / d) * (x[k + 1] - x[k]) if d else x[k]
+    out['floor'] = _rms(_on_grid(icic, exp, species), final_density(exp, species))
+    out['floor_on_icic'] = _rms(_on_grid(exp, icic, species), final_density(icic, species))
+    out['shock_gap_debye'] = abs(out['explicit_shock'] - out['ICIC_shock']) / (exp.length / 200.0)
+    if verbose:
+        print('ultra-resolved baselines, 2048 uniform cells, 20000 PPC, seed stream 1')
+        print('  explicit MC   dt = 0.05/w_pe   wall %7.0f s' % exp.wall)
+        print('  ICIC          dt = 0.2 /w_pe   wall %7.0f s' % icic.wall)
+        print('\ntime step convergence, each against the same run at half the time step')
+        print('  explicit, 0.05 vs 0.025                  %.5f' % out['explicit_dt'])
+        print('  ICIC,     0.2  vs 0.1                    %.5f' % out['ICIC_dt'])
+        print('\ncross-scheme floor, the two baselines against each other')
+        print('  ICIC measured on the explicit grid       %.5f' % out['floor'])
+        print('  explicit measured on the ICIC grid       %.5f' % out['floor_on_icic'])
+        print('\nshock front, from the steepest density gradient')
+        print('  explicit  x = %.6f m' % out['explicit_shock'])
+        print('  ICIC      x = %.6f m' % out['ICIC_shock'])
+        print('  separation                               %.3f Debye lengths'
+              % out['shock_gap_debye'])
+    return out
+
+
+def reference_sensitivity(species='ion'):
+    """Whether the choice of reference scheme changes the sweep at all.
+
+    Every series is measured against both ultra-resolved solutions in turn, ignoring the
+    per-series choice that collect() makes by default.
+    """
+    a, b = collect(species, REFERENCE), collect(species, REFERENCE_ICIC)
+    print('every sweep point against each of the two ultra-resolved baselines\n')
+    print('   %-38s %5s %9s %9s %8s' % ('series', 'PPC', 'vs expl.', 'vs ICIC', 'change'))
+    for (lab, _, pa), (_, _, pb) in zip(a, b):
+        for (ppc, da), (_, db) in zip(pa, pb):
+            print('   %-38s %5d %9.4f %9.4f %7.1f%%'
+                  % (_plain(lab), ppc, da['err'], db['err'],
+                     100 * (db['err'] - da['err']) / da['err']))
+
+
+def cost_at_matched_accuracy(species='ion', reference=None, points=5):
+    """Wall time each series needs to reach the same error, over their common range."""
+    rows = collect(species, reference)
+    E = {_plain(l): _arrays(p, 'err', 'wall') for l, _, p in rows}
+    lo = max(e.min() for e, _ in E.values())
+    hi = min(e.max() for e, _ in E.values())
+    names = list(E)
+    print('cost at matched accuracy, valid over %.4f to %.4f (no extrapolation)' % (lo, hi))
+    print('cost measure: %s\n' % ('total run time' if COST == 'total'
+                                  else 'push, deposit and field solve, diagnostics excluded'))
+    print('   %9s' % 'error' + ''.join('%16s' % n[:15] for n in names))
+    for t in np.linspace(lo, hi, points):
+        cells = []
+        for n in names:
+            e, w = E[n]
+            o = np.argsort(np.log(e))
+            cells.append(float(np.exp(np.interp(np.log(t), np.log(e)[o], np.log(w)[o]))))
+        print('   %9.4f' % t + ''.join('%16.1f' % c for c in cells))
+    print('\n   ratios against %s:' % names[-1])
+    for t in np.linspace(lo, hi, points):
+        vals = []
+        for n in names:
+            e, w = E[n]
+            o = np.argsort(np.log(e))
+            vals.append(float(np.exp(np.interp(np.log(t), np.log(e)[o], np.log(w)[o]))))
+        print('   %9.4f' % t + ''.join('%15.1fx' % (v / vals[-1]) for v in vals))
+
+# ------------------------------------------------------- initial condition
+# The IASW loading, as implemented.  Positions are placed at evenly spaced quantiles of the
+# cumulative distribution rather than sampled, so the initial density profile is the same in
+# every realisation and carries none of the 1/sqrt(N) noise a random placement would.  Only
+# the velocities are drawn.
+#
+#   dist type 1:   n(x) = n_bar (1 + a_n cos(2 pi x / L)),  v_d(x) = v_0 (1 + a_v cos(...))
+#   dist type 2:   n(x) = n_bar (1 + a_n sin(2 pi x / L)),  v_d(x) = v_0 (1 - a_v sin(...))
+#
+# The cell temperature diagnostic is m * sum(v^2) / (N_cell * n_velocity * e), a second
+# moment about zero rather than about the local mean, so it carries the drift:
+#
+#   T_diag(x) = T + m v_d(x)^2 / (n_velocity * e)
+#
+# For the ions the drift term dominates by two orders of magnitude, which is what makes the
+# profile a sharp test of the loading; for the electrons it is negligible against T_e.
+
+_AMU = 1.66053906660e-27
+
+
+def species_parameters(run, species='ion'):
+    """Loading parameters, read back from the input file saved with the run."""
+    path = os.path.join(run.path, 'inputs', 'charged_particles', species + '.inp')
+    fields = {}
+    for line in open(path):
+        if ':' not in line:
+            continue
+        value, key = line.split(':', 1)
+        fields[key.strip().lower()] = value.split()
+    g = lambda k, i=0: float(next(v[i] for k2, v in fields.items() if k2.startswith(k)))
+    dist = fields[next(k for k in fields if k.startswith('dist type'))]
+    return {'mass': g('mass') * _AMU,
+            'density': g('average initial total density'),
+            'temperature': g('average initial temperature'),
+            'drift': g('initial drift'),
+            'n_velocity': int(g('number coordinates', 1)),
+            'dist_type': int(dist[0]),
+            'alpha_n': float(dist[1]) if len(dist) > 1 else 0.0,
+            'alpha_v': float(dist[2]) if len(dist) > 2 else 0.0}
+
+
+def analytic_density(x, par, length):
+    phase = 2.0 * np.pi * x / length
+    if par['dist_type'] == 1:
+        return par['density'] * (1.0 + par['alpha_n'] * np.cos(phase))
+    if par['dist_type'] == 2:
+        return par['density'] * (1.0 + par['alpha_n'] * np.sin(phase))
+    return np.full_like(x, par['density'])
+
+
+def analytic_drift(x, par, length):
+    phase = 2.0 * np.pi * x / length
+    if par['dist_type'] == 1:
+        return par['drift'] * (1.0 + par['alpha_v'] * np.cos(phase))
+    if par['dist_type'] == 2:
+        return par['drift'] * (1.0 - par['alpha_v'] * np.sin(phase))
+    return np.full_like(x, par['drift'])
+
+
+_QE = 1.602176634e-19
+IC_SUFFIX = '_ic'          # initial-condition-only runs, stopped after the first diagnostic
+
+
+def analytic_cell_temperature(x, par, length):
+    """Pointwise: thermal spread plus the local drift.  For drawing the smooth curve."""
+    return par['temperature'] + par['mass'] * analytic_drift(x, par, length) ** 2 \
+        / (par['n_velocity'] * _QE)
+
+
+def _cell_edges(run):
+    if len(run.grid) == run.number_cells + 1:
+        return run.grid
+    half = 0.5 * np.diff(np.append(run.grid, run.grid[0] + run.length))
+    return np.append(run.grid - half, run.grid[-1] + half[-1])
+
+
+def analytic_cell_average(run, par, func, samples=201):
+    """Density-weighted mean of func(x) over each cell.
+
+    Every per-cell particle diagnostic is a sum over the particles that happen to lie in the
+    cell, so what it reports is the density-weighted cell mean, not the value at the centre.
+    On this mesh the drift varies enough across a cell that comparing against the centre
+    value leaves a residual which does not fall with particle number.
+    """
+    edges = _cell_edges(run)
+    out = np.empty(run.number_cells)
+    for i in range(run.number_cells):
+        xs = np.linspace(edges[i], edges[i + 1], samples)
+        w = analytic_density(xs, par, run.length)
+        out[i] = np.trapezoid(w * func(xs), xs) / np.trapezoid(w, xs)
+    return out
+
+
+def cell_drift(run, species='ion', diag=0):
+    """Per-cell mean of v_x, if the run was made with the drift diagnostic."""
+    path = os.path.join(run.path, 'charged_particles', species, 'velocity',
+                        'cell_v_x_%d.dat' % diag)
+    return run.read(path) if os.path.isfile(path) else None
+
+
+def particles_per_cell(run, par):
+    """Expected number of particles in each cell, from the analytic profile.
+
+    Uniform particle weight, so the count follows n(x) times the cell width.  On the mapped
+    mesh this varies by far more than the density perturbation alone.
+    """
+    edges = _cell_edges(run)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    return (analytic_density(centres, par, run.length) * np.diff(edges)
+            * _total_particles(run) / (par['density'] * run.length))
+
+
+def _total_particles(run):
+    """Particles per species, read back from the input files saved with the run."""
+    path = os.path.join(run.path, 'inputs', 'charged_particles', 'ion.inp')
+    per_thread = threads = None
+    for line in open(path):
+        if 'number particles per thread' in line:
+            per_thread = int(float(line.split(':')[0]))
+    for line in open(os.path.join(run.path, 'inputs', 'initial_setup.inp')):
+        if 'openmp threads' in line:
+            threads = int(float(line.split('!')[0]))
+    return per_thread * threads
+
+
+def ic_run(series=0, ppc=125, seed=1):
+    """The initial-condition run for a case, falling back to the production run."""
+    _, pattern, _ = SERIES[series]
+    ic = pattern.replace('_seed%02d', IC_SUFFIX + '_seed%02d')
+    for pat in (ic, pattern):
+        try:
+            return get(pat % (ppc, seed))
+        except (KeyError, IndexError):
+            continue
+    raise KeyError('no run found for series %d at %d PPC seed %d' % (series, ppc, seed))
+
+
+def initial_condition_figure(series=0, ppc=125, seed=1, species='ion',
+                             quantities=('density', 'drift'), residuals=False, save=None):
+    """The loaded initial state against the profile it is meant to represent.
+
+    The drift is a first moment and compares against the analytic profile directly.  The cell
+    temperature is a second moment about zero, so it carries the drift as well; it is the
+    noisier of the two at a given particle count, which is available as quantities=
+    ('density', 'temperature') but is not the cleanest test of the loading.
+
+    residuals=True adds a row of deviation-from-analytic panels under the profiles, with the
+    noise level a random placement would leave for the density and the standard error of a
+    cell mean for the drift.  initial_condition_table() carries the same numbers.
+    """
+    plt = _plt()
+    label, _, style = SERIES[series]
+    r = ic_run(series, ppc, seed)
+    par = species_parameters(r, species)
+    L = r.length
+    fine = np.linspace(0, L, 2001)
+    v_th = np.sqrt(_QE * par['temperature'] / par['mass'])
+    n_cell = particles_per_cell(r, par)
+
+    panels = []
+    for q in quantities:
+        if q == 'density':
+            panels.append(dict(
+                x=r.field_x, y=r.density(species, 0),
+                y_a=analytic_density(r.field_x, par, L),
+                curve=analytic_density(fine, par, L),
+                name='density', unit='$10^{14}$ m$^{-3}$', scale=1e14,
+                rel=True, noise=100.0 / np.sqrt(ppc), noise_label='random placement'))
+        elif q == 'drift':
+            y = cell_drift(r, species, 0)
+            if y is None:
+                raise RuntimeError('%s has no drift diagnostic; run the _ic case' % r.name)
+            panels.append(dict(
+                x=r.cell_x, y=y,
+                y_a=analytic_cell_average(r, par, lambda z: analytic_drift(z, par, L)),
+                curve=analytic_drift(fine, par, L),
+                name='mean drift $v_x$', unit='km s$^{-1}$', scale=1e3,
+                rel=False, noise=v_th / np.sqrt(n_cell) / 1e3,
+                noise_label='$\\pm v_{th}/\\sqrt{N_{cell}}$'))
+        else:
+            panels.append(dict(
+                x=r.cell_x, y=r.temperature(species, 0),
+                y_a=analytic_cell_average(
+                    r, par, lambda z: par['temperature'] + par['mass']
+                    * analytic_drift(z, par, L) ** 2 / (par['n_velocity'] * _QE)),
+                curve=analytic_cell_temperature(fine, par, L),
+                name='cell temperature', unit='eV', scale=1.0,
+                rel=True, noise=100.0 / np.sqrt(ppc), noise_label='random placement'))
+
+    rows = 2 if residuals else 1
+    fig, ax = plt.subplots(rows, len(panels), figsize=(6.4 * len(panels), 8 if residuals else 5),
+                           gridspec_kw={'height_ratios': [2.2, 1]} if residuals else None,
+                           squeeze=False)
+    for col, q in enumerate(panels):
+        a = ax[0, col]
+        b = ax[1, col] if residuals else None
+        x, y, y_a, sc = q['x'], q['y'], q['y_a'], q['scale']
+        a.plot(fine * 1e2, q['curve'] / sc, '-', color='0.35', lw=1.4, label='analytic')
+        if not np.allclose(y_a, np.interp(x, fine, q['curve']), rtol=1e-3):
+            a.plot(x * 1e2, y_a / sc, 's', mfc='none', color='0.35', ms=5,
+                   label='analytic, averaged over each cell')
+        a.plot(x * 1e2, y / sc, 'o', color=style['color'], ms=3.5, label='loaded, %d PPC' % ppc)
+        a.set_ylabel('%s %s (%s)' % (species, q['name'], q['unit']))
+        a.set_title('%s %s at $t=0$' % (species, q['name']), fontsize=10)
+        a.legend(fontsize=8, framealpha=1)
+        a.grid(color='0.85', lw=.5)
+        if b is None:
+            a.set_xlabel('x (cm)')
+            continue
+
+        if q['rel']:
+            dev, unit = 100 * (y - y_a) / y_a, '%'
+            summary = 'RMS %.3f%%' % np.sqrt(np.mean(dev ** 2))
+        else:
+            dev, unit = (y - y_a) / sc, q['unit']
+            summary = 'RMS %.1f m s$^{-1}$' % np.sqrt(np.mean((y - y_a) ** 2))
+        band = np.atleast_1d(q['noise'])
+        b.plot(x * 1e2, dev, 'o-', color=style['color'], ms=3.5, lw=.9, label=summary)
+        b.axhline(0, color='0.6', lw=.6)
+        span = 1.35 * np.max(np.abs(dev))
+        if np.max(band) < span * 3:
+            xb = x * 1e2 if band.size > 1 else np.array([x[0], x[-1]]) * 1e2
+            bb = band if band.size > 1 else np.full(2, band[0])
+            b.plot(xb, bb, ':', color='0.45', lw=1.1, label=q['noise_label'])
+            b.plot(xb, -bb, ':', color='0.45', lw=1.1)
+            span = max(span, 1.2 * np.max(band))
+        else:
+            b.plot([], [], ' ', label='%s: $\\pm$%.2f%s, off scale'
+                   % (q['noise_label'], np.max(band), unit))
+        b.set_ylim(-span, span)
+        b.set_ylabel('deviation from analytic (%s)' % unit)
+        b.set_xlabel('x (cm)')
+        b.legend(fontsize=8, framealpha=1)
+        b.grid(color='0.85', lw=.5)
+    fig.suptitle('initial condition of %s, seed stream %d' % (_plain(label), seed), fontsize=11)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_initial_condition.png')
+
+
+def initial_condition_table(species='ion', seeds=(1, 2, 3)):
+    """How closely the loaded state matches the analytic profile.
+
+    The density is placed at quantiles rather than sampled, so its deviation is identical in
+    every realisation and does not fall with particle number: it is a discretisation
+    signature, not noise.  The drift is sampled, so it falls as 1/sqrt(N).
+    """
+    print('deviation of the loaded state from the analytic profile,'
+          ' mean over seed streams %s\n' % (seeds,))
+    print('   %-38s %5s %10s %12s %12s %11s'
+          % ('series', 'PPC', 'density', 'drift', 'v_th/sqrt(N)', 'random n'))
+    for si, (label, _, _) in enumerate(SERIES):
+        for ppc in PPCS:
+            dn, dv, expect = [], [], []
+            for seed in seeds:
+                try:
+                    r = ic_run(si, ppc, seed)
+                except KeyError:
+                    continue
+                par = species_parameters(r, species)
+                dn.append(_rms(r.density(species, 0),
+                               analytic_density(r.field_x, par, r.length)))
+                v = cell_drift(r, species, 0)
+                if v is not None:
+                    a = analytic_cell_average(
+                        r, par, lambda z: analytic_drift(z, par, r.length))
+                    dv.append(float(np.sqrt(np.mean((v - a) ** 2))))
+                    v_th = np.sqrt(_QE * par['temperature'] / par['mass'])
+                    expect.append(float(np.sqrt(np.mean(
+                        (v_th / np.sqrt(particles_per_cell(r, par))) ** 2))))
+            if not dn:
+                continue
+            print('   %-38s %5d %9.4f%% %9.1f m/s %9.1f m/s %10.2f%%'
+                  % (_plain(label)[:38], ppc, 100 * np.mean(dn),
+                     np.mean(dv) if dv else float('nan'),
+                     np.mean(expect) if expect else float('nan'), 100 / np.sqrt(ppc)))
+        print()
+    print('density        deterministic: placed at quantiles of the CDF, identical every seed')
+    print('drift          sampled, so it falls as 1/sqrt(N)')
+    print('v_th/sqrt(N)   the standard error of a cell mean, what the drift residual should be')
+    print('random n       the density noise a random placement of the same particles would leave')
+
+
+# ------------------------------------------------------------------- figures
+
+# Formats written by save_all().  PDF is what pdflatex takes directly; PNG is kept for quick
+# viewing.  Nothing in these figures uses transparency, so both render identically.
+FORMATS = ('pdf', 'png')
+
+
+def _finish(fig, save, default_name):
+    if save:
+        name = default_name if save is True else save
+        base = name if (os.path.isabs(name) or os.sep in name) else os.path.join(save_dir(), name)
+        stem = os.path.splitext(base)[0]
+        for ext in (FORMATS if save is True else (os.path.splitext(base)[1][1:] or 'png',)):
+            path = stem + '.' + ext
+            fig.savefig(path, dpi=130, bbox_inches='tight')
+            print('wrote', path)
+    _plt().show()
+    return fig
+
+
+def error_figure(species='ion', save=None, reference=None, floor=True, band=True):
+    """Error against the baseline, mean over the seed ensemble with its scatter."""
+    plt = _plt()
+    rows = collect(species, reference)
+    fig, ax = plt.subplots(figsize=(7.2, 5.4))
+    for label, style, pts in rows:
+        p = np.array([q for q, _ in pts], float)
+        err, sd, lo, hi = _arrays(pts, 'err', 'sd', 'lo', 'hi')
+        ax.errorbar(p, err, yerr=sd, ms=5, capsize=3, lw=1.5, label=label, **style)
+        if band:
+            # Blended against white rather than drawn with alpha, because the PostScript
+            # backend has no transparency and would otherwise paint over the curves.
+            rgb = matplotlib.colors.to_rgb(style['color'])
+            ax.fill_between(p, lo, hi, lw=0, zorder=0,
+                            color=tuple(1.0 - 0.15 * (1.0 - c) for c in rgb))
+    slope_row = rows[-2][2]                       # anchored on the explicit 512-cell series
+    p = np.array([q for q, _ in slope_row], float)
+    e0 = slope_row[0][1]['err']
+    ax.plot(p, e0 * (p / p[0]) ** -0.5, ':', color='0.4', lw=1.2, zorder=0,
+            label='$N_{ppc}^{-1/2}$')
+    if floor:
+        f = baseline_check(species, verbose=False)['floor']
+        ax.axhline(f, color='tab:purple', ls='--', lw=1,
+                   label='agreement between the two baselines, %.4f' % f)
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('particles per cell')
+    ax.set_ylabel('RMS relative %s density error' % species)
+    ax.set_title('IASW %s density error at $t=3000/\\omega_{pe}$\n'
+                 'mean of %d RNG streams, bars are the seed-to-seed sd, band is min to max'
+                 % (species, len(SEEDS)), fontsize=10)
+    ax.grid(color='0.85', lw=.5, which='both')
+    ax.legend(fontsize=8, framealpha=1)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_error.png')
+
+
+def timing_figure(species='ion', save=None, reference=None, floor=True):
+    """The same points against what they cost."""
+    plt = _plt()
+    rows = collect(species, reference)
+    fig, ax = plt.subplots(figsize=(7.2, 5.4))
+    for label, style, pts in rows:
+        err, sd, wall = _arrays(pts, 'err', 'sd', 'wall')
+        ax.errorbar(wall, err, yerr=sd, ms=5, capsize=3, lw=1.5, label=label, **style)
+        for (ppc, _), w, e in zip(pts, wall, err):
+            ax.annotate('%d' % ppc, (w, e), textcoords='offset points', xytext=(5, -9),
+                        fontsize=6.5, color=style['color'])
+    if floor:
+        f = baseline_check(species, verbose=False)['floor']
+        ax.axhline(f, color='tab:purple', ls='--', lw=1,
+                   label='agreement between the two baselines, %.4f' % f)
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('%s time (s), 4 threads, runs made sequentially'
+                  % ('total' if COST == 'total' else 'particle push, deposit and field solve'))
+    ax.set_ylabel('RMS relative %s density error' % species)
+    ax.set_title('IASW %s density error against cost at $t=3000/\\omega_{pe}$\n'
+                 'mean of %d RNG streams, labels are particles per cell'
+                 % (species, len(SEEDS)), fontsize=10)
+    ax.grid(color='0.85', lw=.5, which='both')
+    ax.legend(fontsize=8, framealpha=1)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_timing.png')
+
+
+def profile_figure(species='ion', ppc=125, seed=8, series=(1, 2, 3), zoom=(6.9, 8.2),
+                   whole_domain=False, save=None):
+    """Final density profiles of one realisation of each series, against the reference.
+
+    Defaults to the shock front alone, which is where the schemes differ; whole_domain=True
+    adds a panel showing the full profile.  `series` selects which entries of SERIES to draw.
+
+    The default seed is the median of the ten by shock position, for all three series at once,
+    so that the figure shows a representative realisation rather than an extreme one.
+    """
+    plt = _plt()
+    ref = get(REFERENCE)
+    n_ax = 2 if whole_domain else 1
+    fig, axes = plt.subplots(n_ax, 1, figsize=(7.8, 8.0 if whole_domain else 5.0), squeeze=False)
+    axes = axes[:, 0]
+    for ax in axes:
+        ax.plot(ref.field_x * 1e2, final_density(ref, species) / 1e14, '-', color='0.15',
+                lw=1.4, label='reference, 2048 cells, 20000 PPC')
+        for i in series:
+            label, pattern, style = SERIES[i]
+            try:
+                r = get(pattern % (ppc, seed))
+            except (KeyError, IndexError):
+                continue
+            ax.plot(r.field_x * 1e2, final_density(r, species) / 1e14, ms=4, lw=1.1,
+                    label=label, **dict(style, ls='--'))
+        ax.set_ylabel('%s density ($10^{14}$ m$^{-3}$)' % species)
+        ax.grid(color='0.85', lw=.5)
+    # Limits from every curve in the window, not the reference alone, so that an
+    # over- or under-shooting run is not clipped.
+    axes[-1].set_xlim(*zoom)
+    lo, hi = np.inf, -np.inf
+    for line in axes[-1].get_lines():
+        xd, yd = line.get_xdata(), line.get_ydata()
+        m = (xd >= zoom[0]) & (xd <= zoom[1])
+        if m.any():
+            lo, hi = min(lo, yd[m].min()), max(hi, yd[m].max())
+    pad = 0.08 * (hi - lo)
+    axes[-1].set_ylim(lo - pad, hi + pad)
+    axes[-1].set_xlabel('x (cm)')
+    axes[0].legend(fontsize=8, framealpha=1)
+    axes[0].set_title('%s density at the shock front, $t = 3000/\\omega_{pe}$, %d PPC'
+                      % (species, ppc), fontsize=10)
+    if whole_domain:
+        axes[0].set_title('%s density at $t = 3000/\\omega_{pe}$, %d PPC' % (species, ppc),
+                          fontsize=10)
+        axes[1].set_title('the shock front', fontsize=9)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_profile.png')
+
+
+def baseline_figure(species='ion', save=None, xlim=(6.6, 8.4), difference=False):
+    """The two ultra-resolved baselines overlaid: the floor of the study.
+
+    Both are 2048 uniform cells at 20000 PPC, one explicit and momentum conserving, the other
+    implicit and energy conserving.  They are plotted together rather than differenced
+    because the point is how closely they lie on top of one another; the RMS difference and
+    the separation of the shock fronts are what baseline_check() reports.  difference=True
+    plots the relative difference instead.
+    """
+    plt = _plt()
+    b = baseline_check(species, verbose=False)
+    exp, icic = get(REFERENCE), get(REFERENCE_ICIC)
+    if difference:
+        x = exp.field_x
+        n_e, n_i = final_density(exp, species), _on_grid(icic, exp, species)
+        fig, ax = plt.subplots(figsize=(7.6, 5.0))
+        ax.plot(x * 1e2, 100 * (n_i - n_e) / n_e, '-', color='tab:purple', lw=.8,
+                label='ICIC $-$ explicit, RMS %.2f%%' % (100 * b['floor']))
+        ax.axhline(0, color='0.6', lw=.6)
+        ax.set_ylim(-6, 6)
+        ax.set_xlabel('x (cm)')
+        ax.set_ylabel('difference between the baselines (%)')
+        twin = ax.twinx()
+        twin.plot(x * 1e2, n_e / 1e14, '-', color='0.75', lw=1.1, zorder=0)
+        twin.set_ylabel('%s density ($10^{14}$ m$^{-3}$)' % species, color='0.5')
+        twin.tick_params(axis='y', colors='0.5')
+        ax.legend(fontsize=8, loc='upper left', framealpha=1)
+        ax.grid(color='0.85', lw=.5)
+        fig.tight_layout()
+        return _finish(fig, save, 'fig_baseline.png')
+
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(12.2, 4.6))
+    # The two curves lie on top of one another, so the explicit one is drawn thick and pale
+    # underneath and the ICIC thin and dark on top; the pale halo is where they agree.
+    for ax in (a0, a1):
+        ax.plot(exp.field_x * 1e2, final_density(exp, species) / 1e14, '-', color='0.72',
+                lw=3.0, solid_capstyle='round', label='explicit momentum conserving')
+        ax.plot(icic.field_x * 1e2, final_density(icic, species) / 1e14, '-',
+                color='tab:purple', lw=1.0, label='ICIC')
+        ax.set_xlabel('x (cm)')
+        ax.set_ylabel('%s density ($10^{14}$ m$^{-3}$)' % species)
+        ax.grid(color='0.85', lw=.5)
+    a1.set_xlim(*xlim)
+    inside = (exp.field_x * 1e2 >= xlim[0]) & (exp.field_x * 1e2 <= xlim[1])
+    y = final_density(exp, species)[inside] / 1e14
+    pad = 0.06 * (y.max() - y.min())
+    a1.set_ylim(y.min() - pad, y.max() + pad)
+    a0.set_title('whole domain', fontsize=10)
+    a1.set_title('the shock front', fontsize=10)
+    a0.legend(fontsize=8.5, framealpha=1)
+    fig.suptitle('reference solutions at $t = 3000/\\omega_{pe}$, '
+                 '2048 uniform cells and 20000 PPC', fontsize=11)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_baseline.png')
+
+
+def decomposition(species='ion', save=None, reference=None):
+    """Where each scheme's error comes from, and how it responds to ensemble averaging.
+
+    Independent realisations of the same case differ only by particle noise, so their RMS
+    difference isolates the random part; what is left over in quadrature is systematic --
+    mesh discretisation and any standing phase offset -- and does not fall with particle
+    number.  Ensemble averaging acts on the first and not on the second.
+    """
+    plt = _plt()
+    rows = collect(species, reference)
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(12.5, 5))
+    for label, style, pts in rows:
+        p = np.array([q for q, _ in pts], float)
+        colour = style['color']
+        err, rnd, ens = _arrays(pts, 'err', 'pair', 'ens')
+        sysm = np.sqrt(np.clip(err ** 2 - rnd ** 2, 0, None))
+        a0.plot(p, err, 'o-', color=colour, ms=5, lw=1.5, label=label)
+        a0.plot(p, rnd, '^--', color=colour, ms=4, lw=1.1)
+        a0.plot(p, sysm, 's:', color=colour, ms=4, lw=1.1)
+        a1.plot(p, err / ens, ms=5, lw=1.5, label=label, **style)
+    a0.plot([], [], 'ko-', ms=5, label='total error')
+    a0.plot([], [], 'k^--', ms=4, label='random: particle noise alone')
+    a0.plot([], [], 'ks:', ms=4, label='systematic: does not fall with PPC')
+    a0.set_xscale('log'); a0.set_yscale('log')
+    a0.set_xlabel('particles per cell')
+    a0.set_ylabel('RMS relative %s density error' % species)
+    a0.set_title('error split into its random and systematic parts', fontsize=10)
+    a0.legend(fontsize=7.5, framealpha=1); a0.grid(color='0.85', lw=.5, which='both')
+    a1.axhline(np.sqrt(len(SEEDS)), color='0.4', ls=':', lw=1.2,
+               label='$\\sqrt{%d}$, pure Monte Carlo' % len(SEEDS))
+    a1.axhline(1, color='0.7', lw=.8)
+    a1.set_xscale('log'); a1.set_xlabel('particles per cell')
+    a1.set_ylabel('single run error / %d-run average error' % len(SEEDS))
+    a1.set_title('what ensemble averaging buys', fontsize=10)
+    a1.set_ylim(0, 3.6)
+    a1.legend(fontsize=7.5, framealpha=1); a1.grid(color='0.85', lw=.5)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_decomposition.png')
+
+
+def parameters_figure(save=None):
+    """The run parameters as a standalone table, which Referee 1 asked be stated."""
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(9.5, 3.6))
+    ax.axis('off')
+    tab = ax.table(cellText=[list(r) for r in RUN_PARAMETERS],
+                   colLabels=['', 'implicit', 'implicit', 'explicit', 'explicit'],
+                   cellLoc='left', colLoc='left', loc='center')
+    tab.auto_set_font_size(False); tab.set_fontsize(9); tab.scale(1, 1.45)
+    ax.set_title('run parameters; every point is a single run,\n'
+                 'repeated over %d independent RNG streams' % len(SEEDS), fontsize=10)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_parameters.png')
+
+
+# ------------------------------------------------- resolution at fixed PPC
+# Both schemes coarsened at a fixed particle count, to locate where the explicit scheme stops
+# working and to read off what the implicit scheme's error is at the same cost.  The explicit
+# mesh is uniform with the time step tied to it by v_th,e dt / dx = 0.5; the implicit mesh keeps
+# the same inverse-sine map, so its smallest cell stays near half a Debye length while the
+# largest grows.
+
+RESOLUTION_PPC = 100
+RESOLUTION_SEEDS = (1, 2, 3, 4, 5)
+
+# Thread count of the run set to analyse.  These runs are small enough that OpenMP
+# synchronisation, which does not shrink with the problem, is a sizeable part of the cost at
+# the coarsest meshes: on four threads the coarsest implicit case has only 800 particles per
+# thread and its cost per particle rises rather than falls.  The single-thread set measures
+# the algorithm instead, and is the one to use for a statement about scheme cost.
+RESOLUTION_THREADS = 1
+_RES_PREFIX = {1: 'RES1_', 4: 'RES_'}
+
+def _res_series():
+    p = _RES_PREFIX[RESOLUTION_THREADS]
+    return [
+        ('Explicit, uniform mesh', p + 'Exp_%dcells_seed%02d', (512, 400, 256, 200, 128, 100, 64),
+         dict(color='tab:orange', marker='o', ls='-'), 'REFERENCE'),
+        ('ICIC, $\\Delta t=1/\\omega_{pe}$', p + 'ICIC_%dcells_dt1_seed%02d', (64, 48, 32, 24, 16),
+         dict(color='tab:green', marker='^', ls=':'), 'REFERENCE_ICIC'),
+        ('ICIC, $\\Delta t=2/\\omega_{pe}$', p + 'ICIC_%dcells_seed%02d', (64, 48, 32, 24, 16),
+         dict(color='tab:blue', marker='D', ls='--'), 'REFERENCE_ICIC'),
+        ('ICIC, $\\Delta t=4/\\omega_{pe}$', p + 'ICIC_%dcells_dt4_seed%02d', (64, 48, 32, 24, 16),
+         dict(color='tab:red', marker='v', ls='-.'), 'REFERENCE_ICIC'),
+    ]
+
+
+def resolution_collect(species='ion'):
+    """Mean error and cost at each cell count, over the seed set."""
+    rows = []
+    for label, pattern, cells, style, refname in _res_series():
+        ref = get(REFERENCE if refname == 'REFERENCE' else REFERENCE_ICIC)
+        pts = []
+        for nc in cells:
+            runs = []
+            for seed in RESOLUTION_SEEDS:
+                try:
+                    r = get(pattern % (nc, seed))
+                except (KeyError, IndexError):
+                    continue
+                if r.n_dumps() >= r.num_diag:
+                    runs.append(r)
+            if not runs:
+                continue
+            d = seed_point(runs, ref, species)
+            g = np.diff(_cell_edges_from_grid(runs[0]))
+            lam = runs[0].length / 200.0
+            d.update(cells=nc, dx_min=g.min() / lam, dx_max=g.max() / lam,
+                     dt=runs[0].del_t, steps=int(round(runs[0].time[-1] / runs[0].del_t)))
+            pts.append(d)
+        rows.append((label, style, pts))
+    return rows
+
+
+def resolution_table(species='ion'):
+    """Where the explicit scheme fails, and what the implicit costs at the same accuracy."""
+    for label, _, pts in resolution_collect(species):
+        print(label)
+        print('   %6s %10s %10s %9s %10s %9s %9s'
+              % ('cells', 'dx/lam min', 'dx/lam max', 'dt*w_pe', 'error', 'sd', 'cost(s)'))
+        for d in pts:
+            wpe_dt = 3000.0 / d['steps']
+            print('   %6d %10.2f %10.2f %9.3f %10.4f %9.4f %9.1f'
+                  % (d['cells'], d['dx_min'], d['dx_max'], wpe_dt, d['err'], d['sd'], d['wall']))
+        print()
+    print('%d PPC on %d thread(s), mean over seed streams %s, each series against its own'
+          ' 2048-cell reference' % (RESOLUTION_PPC, RESOLUTION_THREADS, RESOLUTION_SEEDS))
+
+
+def resolution_figure(species='ion', save=None):
+    """Error against cost as both schemes are coarsened at fixed particles per cell."""
+    plt = _plt()
+    rows = resolution_collect(species)
+    fig, ax = plt.subplots(figsize=(7.6, 5.4))
+    for label, style, pts in rows:
+        w = np.array([d['wall'] for d in pts])
+        e = np.array([d['err'] for d in pts])
+        sd = np.array([d['sd'] for d in pts])
+        ax.errorbar(w, e, yerr=sd, ms=5, capsize=3, lw=1.5, label=label, **style)
+        for d, wi, ei in zip(pts, w, e):
+            ax.annotate('%d' % d['cells'], (wi, ei), textcoords='offset points',
+                        xytext=(5, -10), fontsize=7, color=style['color'])
+    # the coarsest explicit run does not survive: say so rather than silently omitting it
+    dead = [c for _, _, cells, _, _ in _res_series()[:1] for c in cells
+            if not any(d['cells'] == c for d in rows[0][2])]
+    if dead:
+        last = rows[0][2][-1]
+        ax.annotate('coarser still (%d cells, $\\Delta x=3.1\\lambda_{De}$):\n'
+                    'unstable, run does not complete' % max(dead),
+                    xy=(last['wall'], last['err']), xycoords='data',
+                    xytext=(0.05, 0.90), textcoords='axes fraction',
+                    fontsize=7.5, color='tab:orange', va='top',
+                    arrowprops=dict(arrowstyle='->', color='tab:orange', lw=.8,
+                                    connectionstyle='arc3,rad=-0.2'))
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('particle push, deposit and field solve time (s), %d thread%s'
+                  % (RESOLUTION_THREADS, '' if RESOLUTION_THREADS == 1 else 's'))
+    ax.set_ylabel('RMS relative %s density error' % species)
+    ax.set_title('coarsening both schemes at %d PPC\nlabels are cell counts; explicit time step '
+                 'set by $v_{th,e}\\Delta t/\\Delta x = 0.5$' % RESOLUTION_PPC, fontsize=10)
+    ax.grid(color='0.85', lw=.5, which='both')
+    ax.legend(fontsize=8, framealpha=1)
+    fig.tight_layout()
+    return _finish(fig, save, 'fig_resolution.png')
+
+
+def save_all(species='ion'):
+    """Write every figure to save_dir(), in each format listed in FORMATS."""
+    for fn in (baseline_figure, error_figure, timing_figure, profile_figure, decomposition):
+        fn(species=species, save=True)
+    initial_condition_figure(save=True)
+    parameters_figure(save=True)
+
+
+if __name__ == '__main__':
+    baseline_check()
+    print()
+    table()
